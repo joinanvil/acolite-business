@@ -4,7 +4,7 @@ import { headers } from "next/headers";
 import { createNanoClaw } from "@/lib/nanoclaw";
 import { getMessages, clearMessages } from "@/lib/db";
 
-// Get chat history
+// Get chat history and container status
 export async function GET(request: NextRequest) {
   try {
     const session = await auth.api.getSession({
@@ -16,8 +16,10 @@ export async function GET(request: NextRequest) {
     }
 
     const messages = await getMessages(session.user.id);
+    const nanoclaw = createNanoClaw(session.user.id);
+    const hasActiveContainer = nanoclaw.hasActiveContainer();
 
-    return NextResponse.json({ messages });
+    return NextResponse.json({ messages, hasActiveContainer });
   } catch (error) {
     console.error("GET /api/chat error:", error);
     return NextResponse.json(
@@ -41,9 +43,18 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const { message, action } = body;
 
+    const nanoclaw = createNanoClaw(session.user.id);
+
     // Handle clear action
     if (action === "clear") {
       await clearMessages(session.user.id);
+      await nanoclaw.stopContainer(); // Also stop container when clearing
+      return NextResponse.json({ success: true });
+    }
+
+    // Handle stop container action
+    if (action === "stop") {
+      await nanoclaw.stopContainer();
       return NextResponse.json({ success: true });
     }
 
@@ -53,8 +64,6 @@ export async function POST(request: NextRequest) {
         { status: 400 }
       );
     }
-
-    const nanoclaw = createNanoClaw(session.user.id);
 
     // Stream the response
     const stream = await nanoclaw.streamChat(message);

@@ -4,7 +4,7 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Send, Trash2, Bot, User, Loader2 } from "lucide-react";
+import { Send, Trash2, Bot, User, Loader2, Circle } from "lucide-react";
 
 interface Message {
   id: string;
@@ -18,6 +18,7 @@ export function Chat() {
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [streamingContent, setStreamingContent] = useState("");
+  const [hasActiveContainer, setHasActiveContainer] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -39,6 +40,7 @@ export function Chat() {
       if (response.ok) {
         const data = await response.json();
         setMessages(data.messages || []);
+        setHasActiveContainer(data.hasActiveContainer || false);
       }
     } catch (error) {
       console.error("Failed to load chat history:", error);
@@ -112,6 +114,8 @@ export function Chat() {
             }
           }
         }
+        // Refresh container status after response
+        setHasActiveContainer(true);
       } catch (error) {
         console.error("Chat error:", error);
         // Add error message
@@ -140,6 +144,7 @@ export function Chat() {
         body: JSON.stringify({ action: "clear" }),
       });
       setMessages([]);
+      setHasActiveContainer(false);
     } catch (error) {
       console.error("Failed to clear chat:", error);
     }
@@ -152,6 +157,14 @@ export function Chat() {
         <div className="flex items-center gap-2">
           <Bot className="h-5 w-5 text-primary" />
           <span className="font-medium">NanoClaw Assistant</span>
+          <div className="flex items-center gap-1 text-xs">
+            <Circle
+              className={`h-2 w-2 ${hasActiveContainer ? "fill-green-500 text-green-500" : "fill-gray-300 text-gray-300"}`}
+            />
+            <span className="text-gray-500">
+              {hasActiveContainer ? "Connected" : "Idle"}
+            </span>
+          </div>
         </div>
         <Button
           variant="ghost"

@@ -1,4 +1,4 @@
-import { spawn } from "child_process";
+import { spawn, ChildProcess } from "child_process";
 import fs from "fs";
 import path from "path";
 import {
@@ -10,15 +10,28 @@ import {
 } from "./db";
 
 const CONTAINER_IMAGE = "nanoclaw-agent:latest";
-const CONTAINER_TIMEOUT = 300000; // 5 minutes
+const CONTAINER_TIMEOUT = 300000; // 5 minutes per message
 const GROUPS_DIR = path.join(process.cwd(), "nanoclaw-data", "groups");
 const SESSIONS_DIR = path.join(process.cwd(), "nanoclaw-data", "sessions");
+
+// Registry of active containers per user
+interface ContainerInfo {
+  process: ChildProcess;
+  containerName: string;
+  groupDir: string;
+  ipcDir: string;
+  lastActivity: number;
+  pendingResponses: Map<string, (response: string) => void>;
+  outputBuffer: string;
+}
+
+const activeContainers = new Map<string, ContainerInfo>();
 
 // Ensure directories exist
 function ensureDirs(userId: string) {
   const groupDir = path.join(GROUPS_DIR, userId);
   const sessionDir = path.join(SESSIONS_DIR, userId, ".claude");
-  const ipcDir = path.join(GROUPS_DIR, userId, "ipc");
+  const ipcDir = path.join(groupDir, "ipc");
 
   fs.mkdirSync(path.join(groupDir, "logs"), { recursive: true });
   fs.mkdirSync(path.join(ipcDir, "messages"), { recursive: true });
@@ -56,11 +69,12 @@ interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   assistantName: string;
+  secrets?: Record<string, string>;
 }
 
 interface ContainerOutput {
   status: "success" | "error";
-  result?: string;
+  result?: string | null;
   error?: string;
   newSessionId?: string;
 }
@@ -85,6 +99,223 @@ function formatMessagesAsXml(messages: Message[]): string {
   return formatted.join("\n\n");
 }
 
+const START_MARKER = "---NANOCLAW_OUTPUT_START---";
+const END_MARKER = "---NANOCLAW_OUTPUT_END---";
+
+/**
+ * Check if a container is running for a user
+ */
+function isContainerRunning(userId: string): boolean {
+  const info = activeContainers.get(userId);
+  if (!info) return false;
+
+  // Check if process is still alive
+  if (info.process.killed || info.process.exitCode !== null) {
+    activeContainers.delete(userId);
+    return false;
+  }
+
+  return true;
+}
+
+/**
+ * Start a persistent container for a user
+ */
+async function startContainer(userId: string, initialPrompt: string): Promise<ContainerInfo> {
+  const { groupDir, sessionDir, ipcDir } = ensureDirs(userId);
+
+  // Get existing session
+  const session = await getSession(userId);
+
+  const containerName = `nanoclaw-${userId.slice(0, 12)}`;
+
+  // Check if container already exists (maybe from a previous run)
+  try {
+    const existing = await new Promise<string>((resolve) => {
+      const check = spawn("docker", ["ps", "-aq", "-f", `name=${containerName}`]);
+      let output = "";
+      check.stdout.on("data", (d) => output += d.toString());
+      check.on("close", () => resolve(output.trim()));
+    });
+
+    if (existing) {
+      // Remove the old container
+      await new Promise<void>((resolve) => {
+        const rm = spawn("docker", ["rm", "-f", containerName]);
+        rm.on("close", () => resolve());
+      });
+    }
+  } catch {
+    // Ignore errors
+  }
+
+  const containerInput: ContainerInput = {
+    prompt: initialPrompt,
+    sessionId: session?.session_id || undefined,
+    groupFolder: userId,
+    chatJid: `web:${userId}`,
+    isMain: false,
+    assistantName: "NanoClaw",
+    secrets: {
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || "",
+    },
+  };
+
+  // Docker run command - persistent container
+  const args = [
+    "run",
+    "-i",
+    "--name", containerName,
+    // Mount group folder (includes IPC directory)
+    "-v", `${groupDir}:/workspace/group`,
+    // Mount IPC directory explicitly
+    "-v", `${ipcDir}:/workspace/ipc`,
+    // Mount session folder
+    "-v", `${sessionDir}:/home/node/.claude`,
+    CONTAINER_IMAGE,
+  ];
+
+  console.log(`[NanoClaw] Starting container for user ${userId}: ${containerName}`);
+
+  const proc = spawn("docker", args, {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  const info: ContainerInfo = {
+    process: proc,
+    containerName,
+    groupDir,
+    ipcDir,
+    lastActivity: Date.now(),
+    pendingResponses: new Map(),
+    outputBuffer: "",
+  };
+
+  // Handle stdout - parse output markers
+  proc.stdout.on("data", (chunk: Buffer) => {
+    info.outputBuffer += chunk.toString();
+    info.lastActivity = Date.now();
+
+    // Process complete outputs
+    while (true) {
+      const startIdx = info.outputBuffer.indexOf(START_MARKER);
+      if (startIdx === -1) break;
+
+      const endIdx = info.outputBuffer.indexOf(END_MARKER, startIdx);
+      if (endIdx === -1) break;
+
+      const jsonStr = info.outputBuffer.slice(
+        startIdx + START_MARKER.length,
+        endIdx
+      ).trim();
+
+      info.outputBuffer = info.outputBuffer.slice(endIdx + END_MARKER.length);
+
+      try {
+        const output: ContainerOutput = JSON.parse(jsonStr);
+
+        // Update session if we got a new one
+        if (output.newSessionId) {
+          upsertSession(userId, output.newSessionId);
+        }
+
+        // If we have a result with content, resolve the pending response
+        if (output.result) {
+          const text = output.result
+            .replace(/<internal>[\s\S]*?<\/internal>/g, "")
+            .trim();
+
+          if (text) {
+            // Resolve the oldest pending response
+            const [firstKey] = info.pendingResponses.keys();
+            if (firstKey) {
+              const resolver = info.pendingResponses.get(firstKey);
+              info.pendingResponses.delete(firstKey);
+              resolver?.(text);
+            }
+          }
+        }
+
+        if (output.status === "error" && output.error) {
+          const [firstKey] = info.pendingResponses.keys();
+          if (firstKey) {
+            const resolver = info.pendingResponses.get(firstKey);
+            info.pendingResponses.delete(firstKey);
+            resolver?.(`Error: ${output.error}`);
+          }
+        }
+      } catch {
+        // Parse error, skip
+      }
+    }
+  });
+
+  proc.stderr.on("data", (data: Buffer) => {
+    console.error(`[NanoClaw ${userId}]`, data.toString());
+  });
+
+  proc.on("close", (code) => {
+    console.log(`[NanoClaw] Container for user ${userId} exited with code ${code}`);
+    activeContainers.delete(userId);
+
+    // Reject any pending responses
+    for (const [, resolver] of info.pendingResponses) {
+      resolver("Container exited unexpectedly");
+    }
+    info.pendingResponses.clear();
+  });
+
+  proc.on("error", (err) => {
+    console.error(`[NanoClaw] Container error for user ${userId}:`, err);
+    activeContainers.delete(userId);
+  });
+
+  // Write initial input
+  proc.stdin.write(JSON.stringify(containerInput));
+  proc.stdin.end();
+
+  activeContainers.set(userId, info);
+
+  return info;
+}
+
+/**
+ * Send a message to an existing container via IPC
+ */
+function sendIpcMessage(info: ContainerInfo, message: string): void {
+  const timestamp = Date.now();
+  const random = Math.random().toString(36).slice(2, 8);
+  const filename = `${timestamp}-${random}.json`;
+  const filepath = path.join(info.ipcDir, "input", filename);
+
+  const ipcMessage = {
+    type: "message",
+    text: message,
+  };
+
+  fs.writeFileSync(filepath, JSON.stringify(ipcMessage));
+  info.lastActivity = Date.now();
+
+  console.log(`[NanoClaw] Sent IPC message: ${filename}`);
+}
+
+/**
+ * Wait for a response from the container
+ */
+function waitForResponse(info: ContainerInfo, messageId: string, timeout: number): Promise<string> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      info.pendingResponses.delete(messageId);
+      resolve("Request timed out");
+    }, timeout);
+
+    info.pendingResponses.set(messageId, (response: string) => {
+      clearTimeout(timer);
+      resolve(response);
+    });
+  });
+}
+
 export class NanoClawService {
   private userId: string;
 
@@ -96,41 +327,33 @@ export class NanoClawService {
     // Save user message
     await addMessage(this.userId, "user", userMessage);
 
-    // Get conversation history
+    // Get conversation history for context
     const history = await getMessages(this.userId);
-
-    // Format as XML prompt
     const prompt = formatMessagesAsXml(history);
 
-    // Get existing session
-    const session = await getSession(this.userId);
+    const messageId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    let response: string;
 
-    // Run container
-    const output = await this.runContainer({
-      prompt,
-      sessionId: session?.session_id || undefined,
-      groupFolder: this.userId,
-      chatJid: `web:${this.userId}`,
-      isMain: false,
-      assistantName: "NanoClaw",
-    });
+    if (isContainerRunning(this.userId)) {
+      // Container already running - send via IPC
+      const info = activeContainers.get(this.userId)!;
 
-    // Update session if we got a new one
-    if (output.newSessionId) {
-      await upsertSession(this.userId, output.newSessionId);
+      // Format just the new message for IPC
+      const newMessageXml = `<message from="User" timestamp="${new Date().toISOString()}">\n${escapeXml(userMessage)}\n</message>`;
+
+      sendIpcMessage(info, newMessageXml);
+      response = await waitForResponse(info, messageId, CONTAINER_TIMEOUT);
+    } else {
+      // Start new container with full history
+      const info = await startContainer(this.userId, prompt);
+      response = await waitForResponse(info, messageId, CONTAINER_TIMEOUT);
     }
 
-    // Extract response
-    const content =
-      output.status === "error"
-        ? `I encountered an error: ${output.error || "Unknown error"}`
-        : output.result || "I processed your request but have no response.";
-
     // Save assistant response
-    const savedMessage = await addMessage(this.userId, "assistant", content);
+    const savedMessage = await addMessage(this.userId, "assistant", response);
 
     return {
-      content,
+      content: response,
       messageId: savedMessage.id,
     };
   }
@@ -138,273 +361,50 @@ export class NanoClawService {
   async streamChat(
     userMessage: string
   ): Promise<AsyncIterable<{ type: string; content?: string }>> {
-    // Save user message
-    await addMessage(this.userId, "user", userMessage);
-
-    // Get conversation history
-    const history = await getMessages(this.userId);
-
-    // Format as XML prompt
-    const prompt = formatMessagesAsXml(history);
-
-    // Get existing session
-    const session = await getSession(this.userId);
-
     const userId = this.userId;
 
-    // Create async generator for streaming
+    // Use the non-streaming chat for now, but wrap it in an async generator
     async function* streamGenerator() {
-      const { groupDir, sessionDir } = ensureDirs(userId);
-
-      const containerInput: ContainerInput = {
-        prompt,
-        sessionId: session?.session_id || undefined,
-        groupFolder: userId,
-        chatJid: `web:${userId}`,
-        isMain: false,
-        assistantName: "NanoClaw",
-      };
-
-      // Prepare secrets for container
-      const secrets = {
-        ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || "",
-      };
-
-      const inputWithSecrets = { ...containerInput, secrets };
-
-      // Docker run command
-      const args = [
-        "run",
-        "-i",
-        "--rm",
-        "--name",
-        `nanoclaw-${userId.slice(0, 8)}-${Date.now()}`,
-        // Mount group folder
-        "-v",
-        `${groupDir}:/workspace/group`,
-        // Mount session folder
-        "-v",
-        `${sessionDir}:/home/node/.claude`,
-        CONTAINER_IMAGE,
-      ];
-
-      const proc = spawn("docker", args);
-
-      // Write input to stdin
-      proc.stdin.write(JSON.stringify(inputWithSecrets));
-      proc.stdin.end();
-
-      let fullOutput = "";
-      let buffer = "";
-      const START_MARKER = "---NANOCLAW_OUTPUT_START---";
-      const END_MARKER = "---NANOCLAW_OUTPUT_END---";
-      let gotResult = false;
-
-      // Set up stdout data handler
-      const processChunk = (chunk: Buffer): boolean => {
-        buffer += chunk.toString();
-
-        // Look for output markers
-        while (true) {
-          const startIdx = buffer.indexOf(START_MARKER);
-          if (startIdx === -1) break;
-
-          const endIdx = buffer.indexOf(END_MARKER, startIdx);
-          if (endIdx === -1) break;
-
-          const jsonStr = buffer.slice(
-            startIdx + START_MARKER.length,
-            endIdx
-          ).trim();
-
-          buffer = buffer.slice(endIdx + END_MARKER.length);
-
-          try {
-            const output: ContainerOutput = JSON.parse(jsonStr);
-
-            if (output.result) {
-              // Strip internal tags
-              const text = output.result
-                .replace(/<internal>[\s\S]*?<\/internal>/g, "")
-                .trim();
-
-              if (text) {
-                fullOutput = text;
-                return true; // Got a result with content
-              }
-            }
-
-            if (output.newSessionId) {
-              upsertSession(userId, output.newSessionId);
-            }
-
-            if (output.status === "error" && output.error) {
-              fullOutput = `Error: ${output.error}`;
-              return true; // Got an error result
-            }
-          } catch {
-            // Parse error, skip
-          }
-        }
-        return false;
-      };
-
-      // Process output with timeout
-      const resultPromise = new Promise<string>((resolve) => {
-        const timeout = setTimeout(() => {
-          proc.kill("SIGTERM");
-          resolve(fullOutput || "Request timed out");
-        }, CONTAINER_TIMEOUT);
-
-        proc.stdout.on("data", (chunk: Buffer) => {
-          if (processChunk(chunk) && !gotResult) {
-            gotResult = true;
-            clearTimeout(timeout);
-            // Kill the container after getting the result
-            // (it would otherwise wait for IPC messages)
-            setTimeout(() => {
-              proc.kill("SIGTERM");
-            }, 100);
-            resolve(fullOutput);
-          }
-        });
-
-        proc.stderr.on("data", (data: Buffer) => {
-          // Log stderr but don't fail
-          console.error("[nanoclaw stderr]", data.toString());
-        });
-
-        proc.on("close", () => {
-          clearTimeout(timeout);
-          resolve(fullOutput || "No response from agent");
-        });
-      });
-
-      const result = await resultPromise;
-
-      // Save the response
-      if (result) {
-        await addMessage(userId, "assistant", result);
-      }
-
-      yield { type: "text", content: result };
+      const service = new NanoClawService(userId);
+      const result = await service.chat(userMessage);
+      yield { type: "text", content: result.content };
       yield { type: "done" };
     }
 
     return streamGenerator();
   }
 
-  private async runContainer(input: ContainerInput): Promise<ContainerOutput> {
-    const { groupDir, sessionDir } = ensureDirs(this.userId);
-
-    // Prepare secrets for container
-    const secrets = {
-      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || "",
-    };
-
-    const inputWithSecrets = { ...input, secrets };
-
-    return new Promise((resolve) => {
-      const args = [
-        "run",
-        "-i",
-        "--rm",
-        "--name",
-        `nanoclaw-${this.userId.slice(0, 8)}-${Date.now()}`,
-        // Mount group folder
-        "-v",
-        `${groupDir}:/workspace/group`,
-        // Mount session folder
-        "-v",
-        `${sessionDir}:/home/node/.claude`,
-        CONTAINER_IMAGE,
-      ];
-
-      const proc = spawn("docker", args);
-
-      // Write input to stdin
-      proc.stdin.write(JSON.stringify(inputWithSecrets));
-      proc.stdin.end();
-
-      let stdout = "";
-      let stderr = "";
-
-      proc.stdout.on("data", (data) => {
-        stdout += data.toString();
-      });
-
-      proc.stderr.on("data", (data) => {
-        stderr += data.toString();
-      });
-
-      // Timeout
-      const timeout = setTimeout(() => {
-        proc.kill("SIGTERM");
-        resolve({
-          status: "error",
-          error: "Container timeout",
-        });
-      }, CONTAINER_TIMEOUT);
-
-      proc.on("close", (code) => {
-        clearTimeout(timeout);
-
-        // Parse output
-        const START_MARKER = "---NANOCLAW_OUTPUT_START---";
-        const END_MARKER = "---NANOCLAW_OUTPUT_END---";
-
-        const outputs: ContainerOutput[] = [];
-        let buffer = stdout;
-
-        while (true) {
-          const startIdx = buffer.indexOf(START_MARKER);
-          if (startIdx === -1) break;
-
-          const endIdx = buffer.indexOf(END_MARKER, startIdx);
-          if (endIdx === -1) break;
-
-          const jsonStr = buffer
-            .slice(startIdx + START_MARKER.length, endIdx)
-            .trim();
-          buffer = buffer.slice(endIdx + END_MARKER.length);
-
-          try {
-            outputs.push(JSON.parse(jsonStr));
-          } catch {
-            // Skip invalid JSON
-          }
-        }
-
-        if (outputs.length > 0) {
-          // Return the last output (final result)
-          const lastOutput = outputs[outputs.length - 1];
-          // Combine all results
-          const allResults = outputs
-            .map((o) => o.result)
-            .filter(Boolean)
-            .join("\n");
-
-          resolve({
-            ...lastOutput,
-            result: allResults || lastOutput.result,
-          });
-        } else if (code !== 0) {
-          resolve({
-            status: "error",
-            error: stderr || `Container exited with code ${code}`,
-          });
-        } else {
-          resolve({
-            status: "error",
-            error: "No output from container",
-          });
-        }
-      });
-    });
-  }
-
   async getHistory(): Promise<Message[]> {
     return getMessages(this.userId);
+  }
+
+  /**
+   * Check if this user has an active container
+   */
+  hasActiveContainer(): boolean {
+    return isContainerRunning(this.userId);
+  }
+
+  /**
+   * Stop the container for this user
+   */
+  async stopContainer(): Promise<void> {
+    const info = activeContainers.get(this.userId);
+    if (info) {
+      // Send close sentinel
+      const closePath = path.join(info.ipcDir, "input", "_close");
+      fs.writeFileSync(closePath, "");
+
+      // Wait a bit for graceful shutdown
+      await new Promise((resolve) => setTimeout(resolve, 1000));
+
+      // Force kill if still running
+      if (!info.process.killed) {
+        info.process.kill("SIGTERM");
+      }
+
+      activeContainers.delete(this.userId);
+    }
   }
 }
 
@@ -412,3 +412,24 @@ export class NanoClawService {
 export function createNanoClaw(userId: string): NanoClawService {
   return new NanoClawService(userId);
 }
+
+// Cleanup function for graceful shutdown
+export async function cleanupAllContainers(): Promise<void> {
+  console.log(`[NanoClaw] Cleaning up ${activeContainers.size} containers...`);
+
+  for (const [userId, info] of activeContainers) {
+    try {
+      const closePath = path.join(info.ipcDir, "input", "_close");
+      fs.writeFileSync(closePath, "");
+      info.process.kill("SIGTERM");
+    } catch (err) {
+      console.error(`[NanoClaw] Error cleaning up container for ${userId}:`, err);
+    }
+  }
+
+  activeContainers.clear();
+}
+
+// Handle process exit
+process.on("SIGTERM", cleanupAllContainers);
+process.on("SIGINT", cleanupAllContainers);
