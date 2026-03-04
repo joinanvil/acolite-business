@@ -44,6 +44,32 @@ export async function initDb() {
     )
   `);
 
+  // Scheduled tasks table
+  await client.execute(`
+    CREATE TABLE IF NOT EXISTS nanoclaw_scheduled_tasks (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      prompt TEXT NOT NULL,
+      schedule_type TEXT NOT NULL CHECK(schedule_type IN ('once', 'interval', 'cron')),
+      schedule_value TEXT NOT NULL,
+      next_run TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending', 'running', 'completed', 'failed')),
+      last_run TEXT,
+      last_result TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    )
+  `);
+
+  await client.execute(`
+    CREATE INDEX IF NOT EXISTS idx_nanoclaw_tasks_user_id
+    ON nanoclaw_scheduled_tasks(user_id)
+  `);
+
+  await client.execute(`
+    CREATE INDEX IF NOT EXISTS idx_nanoclaw_tasks_next_run
+    ON nanoclaw_scheduled_tasks(status, next_run)
+  `);
+
   initialized = true;
 }
 
@@ -144,5 +170,133 @@ export async function clearMessages(userId: string): Promise<void> {
   await client.execute({
     sql: `DELETE FROM nanoclaw_messages WHERE user_id = ?`,
     args: [userId],
+  });
+}
+
+// Scheduled Tasks
+
+export interface ScheduledTask {
+  id: string;
+  user_id: string;
+  prompt: string;
+  schedule_type: "once" | "interval" | "cron";
+  schedule_value: string;
+  next_run: string;
+  status: "pending" | "running" | "completed" | "failed";
+  last_run: string | null;
+  last_result: string | null;
+  created_at: string;
+}
+
+export async function createScheduledTask(
+  userId: string,
+  prompt: string,
+  scheduleType: "once" | "interval" | "cron",
+  scheduleValue: string,
+  nextRun: Date
+): Promise<ScheduledTask> {
+  await initDb();
+  const id = `task-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const created_at = new Date().toISOString();
+  const next_run = nextRun.toISOString();
+
+  await client.execute({
+    sql: `INSERT INTO nanoclaw_scheduled_tasks (id, user_id, prompt, schedule_type, schedule_value, next_run, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    args: [id, userId, prompt, scheduleType, scheduleValue, next_run, created_at],
+  });
+
+  return {
+    id,
+    user_id: userId,
+    prompt,
+    schedule_type: scheduleType,
+    schedule_value: scheduleValue,
+    next_run,
+    status: "pending",
+    last_run: null,
+    last_result: null,
+    created_at,
+  };
+}
+
+export async function getDueTasks(): Promise<ScheduledTask[]> {
+  await initDb();
+  const now = new Date().toISOString();
+
+  const result = await client.execute({
+    sql: `SELECT * FROM nanoclaw_scheduled_tasks
+          WHERE status = 'pending' AND next_run <= ?
+          ORDER BY next_run ASC`,
+    args: [now],
+  });
+
+  return result.rows.map((row) => ({
+    id: row.id as string,
+    user_id: row.user_id as string,
+    prompt: row.prompt as string,
+    schedule_type: row.schedule_type as "once" | "interval" | "cron",
+    schedule_value: row.schedule_value as string,
+    next_run: row.next_run as string,
+    status: row.status as "pending" | "running" | "completed" | "failed",
+    last_run: row.last_run as string | null,
+    last_result: row.last_result as string | null,
+    created_at: row.created_at as string,
+  }));
+}
+
+export async function getScheduledTasksForUser(userId: string): Promise<ScheduledTask[]> {
+  await initDb();
+  const result = await client.execute({
+    sql: `SELECT * FROM nanoclaw_scheduled_tasks
+          WHERE user_id = ? AND status IN ('pending', 'running')
+          ORDER BY next_run ASC`,
+    args: [userId],
+  });
+
+  return result.rows.map((row) => ({
+    id: row.id as string,
+    user_id: row.user_id as string,
+    prompt: row.prompt as string,
+    schedule_type: row.schedule_type as "once" | "interval" | "cron",
+    schedule_value: row.schedule_value as string,
+    next_run: row.next_run as string,
+    status: row.status as "pending" | "running" | "completed" | "failed",
+    last_run: row.last_run as string | null,
+    last_result: row.last_result as string | null,
+    created_at: row.created_at as string,
+  }));
+}
+
+export async function updateTaskStatus(
+  taskId: string,
+  status: "pending" | "running" | "completed" | "failed",
+  lastResult?: string,
+  nextRun?: Date
+): Promise<void> {
+  await initDb();
+
+  if (nextRun) {
+    await client.execute({
+      sql: `UPDATE nanoclaw_scheduled_tasks
+            SET status = ?, last_run = datetime('now'), last_result = ?, next_run = ?
+            WHERE id = ?`,
+      args: [status, lastResult ?? null, nextRun.toISOString(), taskId],
+    });
+  } else {
+    await client.execute({
+      sql: `UPDATE nanoclaw_scheduled_tasks
+            SET status = ?, last_run = datetime('now'), last_result = ?
+            WHERE id = ?`,
+      args: [status, lastResult ?? null, taskId],
+    });
+  }
+}
+
+export async function deleteScheduledTask(taskId: string): Promise<void> {
+  await initDb();
+  await client.execute({
+    sql: `DELETE FROM nanoclaw_scheduled_tasks WHERE id = ?`,
+    args: [taskId],
   });
 }

@@ -3,6 +3,7 @@ import { auth } from "@/lib/auth";
 import { headers } from "next/headers";
 import { createNanoClaw } from "@/lib/nanoclaw";
 import { getMessages, clearMessages } from "@/lib/db";
+import { getPendingMessages, getUserTasks } from "@/lib/task-scheduler";
 
 // Get chat history and container status
 export async function GET(request: NextRequest) {
@@ -19,7 +20,24 @@ export async function GET(request: NextRequest) {
     const nanoclaw = createNanoClaw(session.user.id);
     const hasActiveContainer = nanoclaw.hasActiveContainer();
 
-    return NextResponse.json({ messages, hasActiveContainer });
+    // Get any pending messages from scheduled tasks
+    const pendingMessages = getPendingMessages(session.user.id);
+
+    // Get scheduled tasks for this user
+    const scheduledTasks = await getUserTasks(session.user.id);
+
+    return NextResponse.json({
+      messages,
+      hasActiveContainer,
+      pendingMessages,
+      scheduledTasks: scheduledTasks.map((t) => ({
+        id: t.id,
+        prompt: t.prompt.slice(0, 100),
+        scheduleType: t.schedule_type,
+        nextRun: t.next_run,
+        status: t.status,
+      })),
+    });
   } catch (error) {
     console.error("GET /api/chat error:", error);
     return NextResponse.json(

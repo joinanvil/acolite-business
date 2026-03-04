@@ -48,6 +48,28 @@ function ensureDirs(userId: string) {
 
 This is your persistent memory file. You can write notes here to remember across conversations.
 
+## Your Capabilities
+
+You have access to powerful MCP tools for scheduling and messaging:
+
+### Scheduling Tasks
+Use the \`mcp__nanoclaw__schedule_task\` tool to schedule tasks:
+- **once**: Run at a specific time (e.g., "2026-03-04T15:30:00" - local time, no Z suffix)
+- **interval**: Run repeatedly (e.g., "300000" for every 5 minutes)
+- **cron**: Run on a schedule (e.g., "0 9 * * *" for daily at 9am)
+
+Example: To remind the user in 1 minute, use schedule_task with:
+- schedule_type: "once"
+- schedule_value: the target timestamp in local time (e.g., "2026-03-04T15:31:00")
+- prompt: "Say hi to the user and remind them about [topic]"
+- context_mode: "group" (to have chat history) or "isolated" (fresh session)
+
+### Sending Messages
+Use \`mcp__nanoclaw__send_message\` to send immediate messages to the user.
+
+### Web Search
+Use the \`WebSearch\` and \`WebFetch\` tools to search the web and fetch content.
+
 ## Available Skills
 
 You have access to specialized skills in /workspace/skills/. When a task matches a skill's description, read the skill's SKILL.md to learn how to perform that task effectively.
@@ -170,6 +192,7 @@ async function startContainer(userId: string, initialPrompt: string): Promise<Co
     assistantName: "NanoClaw",
     secrets: {
       ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || "",
+      HUNTER_API_KEY: process.env.HUNTER_API_KEY || "",
     },
   };
 
