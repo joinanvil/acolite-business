@@ -145,20 +145,25 @@ async function processIpcTasks(): Promise<void> {
           if (data.type === "schedule_task") {
             let nextRun: Date;
             if (data.schedule_type === "once") {
-              // Parse local time - schedule_value is in local time without Z suffix
-              // e.g., "2026-03-04T18:33:17" means 6:33 PM local time
-              const localTimeStr = data.schedule_value;
+              // The agent outputs timestamps without timezone suffix
+              // These are actually UTC times, so treat them as UTC
+              const timeStr = data.schedule_value;
 
-              // If it doesn't have a timezone, treat as local time
-              if (!localTimeStr.endsWith('Z') && !localTimeStr.includes('+') && !localTimeStr.includes('-', 10)) {
-                // Parse as local time by creating a date object
-                // JavaScript's Date constructor treats strings without timezone as local
-                nextRun = new Date(localTimeStr);
+              // Add Z suffix to treat as UTC if no timezone specified
+              if (!timeStr.endsWith('Z') && !timeStr.includes('+') && !timeStr.includes('-', 10)) {
+                nextRun = new Date(timeStr + 'Z');
               } else {
-                nextRun = new Date(localTimeStr);
+                nextRun = new Date(timeStr);
               }
 
-              logScheduler(`Parsed time: input="${localTimeStr}" -> nextRun=${nextRun.toISOString()} (local: ${nextRun.toString()})`);
+              logScheduler(`Parsed time: input="${timeStr}" -> nextRun=${nextRun.toISOString()}`);
+
+              // Sanity check: if nextRun is more than 1 hour in the past, something is wrong
+              const now = new Date();
+              if (nextRun.getTime() < now.getTime() - 3600000) {
+                logScheduler(`Warning: Task scheduled for past time, adjusting to 1 minute from now`);
+                nextRun = new Date(now.getTime() + 60000);
+              }
             } else if (data.schedule_type === "interval") {
               const intervalMs = parseInt(data.schedule_value, 10);
               nextRun = new Date(Date.now() + intervalMs);
