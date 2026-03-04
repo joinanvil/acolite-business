@@ -48,6 +48,18 @@ function ensureDirs(userId: string) {
 
 This is your persistent memory file. You can write notes here to remember across conversations.
 
+## Available Skills
+
+You have access to specialized skills in /workspace/skills/. When a task matches a skill's description, read the skill's SKILL.md to learn how to perform that task effectively.
+
+Current skills:
+- **market-research**: Comprehensive market research, competitor analysis, pricing research, market sizing
+
+To use a skill, read its SKILL.md file first:
+\`\`\`
+Read /workspace/skills/market-research/SKILL.md
+\`\`\`
+
 ## User Preferences
 
 (none yet)
@@ -161,6 +173,9 @@ async function startContainer(userId: string, initialPrompt: string): Promise<Co
     },
   };
 
+  // Skills directory
+  const skillsDir = path.join(process.cwd(), "skills");
+
   // Docker run command - persistent container
   const args = [
     "run",
@@ -172,6 +187,8 @@ async function startContainer(userId: string, initialPrompt: string): Promise<Co
     "-v", `${ipcDir}:/workspace/ipc`,
     // Mount session folder
     "-v", `${sessionDir}:/home/node/.claude`,
+    // Mount skills directory
+    "-v", `${skillsDir}:/workspace/skills:ro`,
     CONTAINER_IMAGE,
   ];
 
