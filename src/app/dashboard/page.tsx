@@ -289,7 +289,7 @@ export default function DashboardPage() {
                                 : task.status}
                         </span>
                         {task.schedule_type &&
-                          task.schedule_type !== "immediate" && (
+                          task.schedule_type != null && (
                             <span className="text-xs bg-gray-700 text-gray-300 px-2 py-0.5 rounded flex items-center gap-1">
                               {task.schedule_type === "interval" ||
                               task.schedule_type === "cron" ? (
@@ -321,8 +321,8 @@ export default function DashboardPage() {
                 .filter(
                   (t) =>
                     t.status === "completed" &&
-                    t.result &&
-                    t.result.length > 50
+                    t.last_result &&
+                    t.last_result.length > 50
                 )
                 .slice(0, 3)
                 .map((task) => (
@@ -341,7 +341,7 @@ export default function DashboardPage() {
                 ))}
               {tasks.filter(
                 (t) =>
-                  t.status === "completed" && t.result && t.result.length > 50
+                  t.status === "completed" && t.last_result && t.last_result.length > 50
               ).length === 0 && (
                 <p className="text-sm text-gray-400 py-2">
                   No documents yet.

@@ -3,16 +3,21 @@ import path from "path";
 import { createNanoClaw } from "./nanoclaw";
 import {
   addMessage,
-  createScheduledTask,
-  getDueTasks,
-  getScheduledTasksForUser,
-  updateTaskStatus,
-  deleteScheduledTask,
   createPayment,
   upsertDeployment,
   updateUserSettings,
-  type ScheduledTask,
 } from "./db";
+import {
+  createTask,
+  promoteScheduledTasks,
+  getDueScheduledTasks,
+  getQueuedImmediateTasks,
+  transitionTaskStatus,
+  checkPolicies,
+  addTaskLog,
+  listTasks,
+} from "./task-queue";
+import type { Task } from "./task-queue";
 
 const GROUPS_DIR = path.join(process.cwd(), "nanoclaw-data", "groups");
 const POLL_INTERVAL = 5000; // 5 seconds
@@ -38,10 +43,10 @@ export function getPendingMessages(userId: string): { text: string; timestamp: s
 }
 
 /**
- * Get scheduled tasks for a user (delegates to db)
+ * Get tasks for a user (from unified task queue)
  */
-export async function getUserTasks(userId: string): Promise<ScheduledTask[]> {
-  return getScheduledTasksForUser(userId);
+export async function getUserTasks(userId: string): Promise<Task[]> {
+  return listTasks(userId, { status: ["todo", "queued", "in_progress"] });
 }
 
 /**
@@ -49,7 +54,7 @@ export async function getUserTasks(userId: string): Promise<ScheduledTask[]> {
  */
 export async function cancelTask(taskId: string): Promise<boolean> {
   try {
-    await deleteScheduledTask(taskId);
+    await transitionTaskStatus(taskId, "cancelled");
     return true;
   } catch {
     return false;
@@ -113,14 +118,11 @@ async function processIpcMessages(): Promise<void> {
 }
 
 /**
- * Process IPC task files from containers
+ * Process IPC task files from containers — creates tasks in the unified task queue
  */
 async function processIpcTasks(): Promise<void> {
   try {
-    // Find all group directories
-    if (!fs.existsSync(GROUPS_DIR)) {
-      return;
-    }
+    if (!fs.existsSync(GROUPS_DIR)) return;
 
     const groups = fs.readdirSync(GROUPS_DIR).filter((f) => {
       const stat = fs.statSync(path.join(GROUPS_DIR, f));
@@ -146,13 +148,11 @@ async function processIpcTasks(): Promise<void> {
           const data = JSON.parse(content);
 
           if (data.type === "schedule_task") {
-            let nextRun: Date;
-            if (data.schedule_type === "once") {
-              // The agent outputs timestamps without timezone suffix
-              // These are actually UTC times, so treat them as UTC
-              const timeStr = data.schedule_value;
+            let nextRun: Date | undefined;
+            const scheduleType = data.schedule_type || "once";
 
-              // Add Z suffix to treat as UTC if no timezone specified
+            if (scheduleType === "once") {
+              const timeStr = data.schedule_value;
               if (!timeStr.endsWith('Z') && !timeStr.includes('+') && !timeStr.includes('-', 10)) {
                 nextRun = new Date(timeStr + 'Z');
               } else {
@@ -161,13 +161,12 @@ async function processIpcTasks(): Promise<void> {
 
               logScheduler(`Parsed time: input="${timeStr}" -> nextRun=${nextRun.toISOString()}`);
 
-              // Sanity check: if nextRun is more than 1 hour in the past, something is wrong
               const now = new Date();
               if (nextRun.getTime() < now.getTime() - 3600000) {
                 logScheduler(`Warning: Task scheduled for past time, adjusting to 1 minute from now`);
                 nextRun = new Date(now.getTime() + 60000);
               }
-            } else if (data.schedule_type === "interval") {
+            } else if (scheduleType === "interval") {
               const intervalMs = parseInt(data.schedule_value, 10);
               nextRun = new Date(Date.now() + intervalMs);
             } else {
@@ -175,28 +174,30 @@ async function processIpcTasks(): Promise<void> {
               nextRun = new Date(Date.now() + 60000);
             }
 
-            // Create task in database
-            const task = await createScheduledTask(
-              userId,
-              data.prompt,
-              data.schedule_type || "once",
-              data.schedule_value,
-              nextRun
-            );
+            // Create task in unified task queue
+            const prompt = data.prompt as string;
+            const task = await createTask({
+              user_id: userId,
+              title: prompt.slice(0, 80),
+              prompt,
+              status: nextRun ? "todo" : "queued",
+              created_by: "agent",
+              schedule_type: scheduleType,
+              schedule_value: data.schedule_value,
+              next_run: nextRun,
+            });
 
             logScheduler(
-              `Task created: ${task.id} for ${nextRun.toISOString()} (prompt: ${data.prompt.slice(0, 50)}...)`
+              `Task created: ${task.id} for ${nextRun?.toISOString() ?? "immediate"} (prompt: ${prompt.slice(0, 50)}...)`
             );
           } else {
             logScheduler(`Unknown task type: ${data.type}`);
           }
 
-          // Delete processed file
           fs.unlinkSync(filePath);
           logScheduler(`Deleted processed file: ${file}`);
         } catch (err) {
           logScheduler(`Error processing task file ${file}: ${err}`);
-          // Move to failed directory or delete
           try {
             fs.unlinkSync(filePath);
           } catch {
@@ -282,52 +283,65 @@ async function processIpcData(): Promise<void> {
 }
 
 /**
- * Execute due tasks
+ * Execute due tasks from the unified task queue
  */
 async function executeDueTasks(): Promise<void> {
   try {
-    const dueTasks = await getDueTasks();
+    // Promote scheduled tasks whose time has come (todo → queued)
+    await promoteScheduledTasks();
 
-    if (dueTasks.length > 0) {
-      logScheduler(`Found ${dueTasks.length} due task(s)`);
+    // Get tasks ready to execute
+    const dueTasks = await getDueScheduledTasks();
+    const immediateTasks = await getQueuedImmediateTasks();
+    const allTasks = [...dueTasks, ...immediateTasks];
+
+    if (allTasks.length > 0) {
+      logScheduler(`Found ${allTasks.length} task(s) to execute`);
     }
 
-    for (const task of dueTasks) {
-      logScheduler(`Executing task: ${task.id} (prompt: ${task.prompt.slice(0, 50)}...)`);
+    for (const task of allTasks) {
+      if (!task.prompt) {
+        logScheduler(`Skipping task ${task.id}: no prompt`);
+        continue;
+      }
 
-      // Mark as running
-      await updateTaskStatus(task.id, "running");
+      logScheduler(`Executing task: ${task.id} "${task.title}" (prompt: ${task.prompt.slice(0, 50)}...)`);
+
+      // Check policies before executing
+      const policyCheck = await checkPolicies(task.user_id, task);
+      if (!policyCheck.allowed) {
+        logScheduler(`Task ${task.id} blocked by policies: ${policyCheck.violations.join(", ")}`);
+        continue;
+      }
+
+      // Mark as in_progress
+      await transitionTaskStatus(task.id, "in_progress");
+      await addTaskLog(task.id, "started");
+      const startTime = Date.now();
 
       try {
         // Create NanoClaw instance for the user
         const nanoclaw = createNanoClaw(task.user_id);
 
-        // Execute the task prompt as a scheduled task
+        // Execute the task prompt
         const scheduledPrompt = `[SCHEDULED TASK]\n\n${task.prompt}`;
         const response = await nanoclaw.chat(scheduledPrompt);
 
         // Save the response as a message from the assistant
         await addMessage(task.user_id, "assistant", `[Scheduled] ${response.content}`);
 
+        const durationMs = Date.now() - startTime;
         logScheduler(`Task completed: ${task.id} - response: ${response.content.slice(0, 100)}...`);
 
-        // Handle based on schedule type
-        if (task.schedule_type === "once") {
-          await updateTaskStatus(task.id, "completed", response.content);
-          logScheduler(`One-time task completed: ${task.id}`);
-        } else if (task.schedule_type === "interval") {
-          // Reschedule for next interval
-          const intervalMs = parseInt(task.schedule_value, 10);
-          const nextRun = new Date(Date.now() + intervalMs);
-          await updateTaskStatus(task.id, "pending", response.content, nextRun);
-          logScheduler(`Rescheduled interval task: ${task.id} for ${nextRun.toISOString()}`);
-        } else {
-          // For cron, mark as completed (would need cron parser for proper rescheduling)
-          await updateTaskStatus(task.id, "completed", response.content);
-        }
+        // transitionTaskStatus handles interval rescheduling internally
+        await transitionTaskStatus(task.id, "completed", response.content);
+        await addTaskLog(task.id, "completed", { result: response.content, duration_ms: durationMs });
       } catch (err) {
-        logScheduler(`Task failed: ${task.id} - ${err}`);
-        await updateTaskStatus(task.id, "failed", String(err));
+        const durationMs = Date.now() - startTime;
+        const errorStr = String(err);
+        logScheduler(`Task failed: ${task.id} - ${errorStr}`);
+        await transitionTaskStatus(task.id, "failed", undefined, errorStr);
+        await addTaskLog(task.id, "failed", { error: errorStr, duration_ms: durationMs });
       }
     }
   } catch (err) {

@@ -51,30 +51,40 @@ This is your persistent memory file. You can write notes here to remember across
 
 ## Your Capabilities
 
-You have access to powerful MCP tools for scheduling and messaging:
-
 ### Scheduling Tasks
-Use the \`mcp__nanoclaw__schedule_task\` tool to schedule tasks:
-- **once**: Run at a specific time. Use LOCAL time format without Z suffix (e.g., "2026-03-04T15:30:00")
-- **interval**: Run repeatedly (e.g., "60000" for every 1 minute, "300000" for every 5 minutes)
+To schedule a task, write a JSON file to /workspace/ipc/tasks/. The scheduler picks these up every 5 seconds.
+
+\`\`\`bash
+echo '{"type":"schedule_task","prompt":"Your task prompt here","schedule_type":"once","schedule_value":"2026-03-06T09:00:00"}' > /workspace/ipc/tasks/$(date +%s)-task.json
+\`\`\`
+
+**Schedule types:**
+- **once**: Run at a specific time. Use LOCAL time format without Z suffix (e.g., "2026-03-06T09:00:00")
+- **interval**: Run repeatedly. Value is milliseconds (e.g., "60000" for every 1 minute, "300000" for every 5 minutes)
 - **cron**: Run on a schedule (e.g., "0 9 * * *" for daily at 9am)
 
-IMPORTANT: For "once" schedule type:
+**IMPORTANT for "once" schedule type:**
 - Get the current local time using: \`date +"%Y-%m-%dT%H:%M:%S"\`
 - If user says "in X minutes", add X minutes to current local time
+- If user says "tomorrow morning", use tomorrow's date at 09:00:00
 - Format: "YYYY-MM-DDTHH:MM:SS" (NO Z suffix, NO timezone offset)
 
-Example: To remind the user in 1 minute:
-1. Check current time with Bash: \`date +"%Y-%m-%dT%H:%M:%S"\`
-2. Add 1 minute to get target time
-3. Call schedule_task with:
-   - schedule_type: "once"
-   - schedule_value: the calculated local timestamp (e.g., "2026-03-04T18:31:00")
-   - prompt: "Use the send_message tool to say hi to the user"
-   - context_mode: "isolated"
+**The prompt field** is what will be executed when the task fires. Include everything the agent needs to do, for example:
+- "Send an email to barak@acolite.ai with subject 'Hello' and body 'Hi Barak, just wanted to say hello!'"
+- "Check the latest news about AI and send a summary to the user"
+
+Example: Schedule an email for tomorrow at 9am:
+\`\`\`bash
+echo '{"type":"schedule_task","prompt":"Read /workspace/skills/agentmail/SKILL.md, then send an email to user@example.com with subject Hello and a friendly greeting body","schedule_type":"once","schedule_value":"2026-03-06T09:00:00"}' > /workspace/ipc/tasks/$(date +%s)-task.json
+\`\`\`
+
+Scheduled tasks appear in the user's dashboard and the user can see their status.
 
 ### Sending Messages
-Use \`mcp__nanoclaw__send_message\` to send immediate messages to the user.
+To send an immediate message to the user (appears in their chat):
+\`\`\`bash
+echo '{"type":"message","text":"Your message here"}' > /workspace/ipc/messages/$(date +%s)-msg.json
+\`\`\`
 
 ### Web Search
 Use the \`WebSearch\` and \`WebFetch\` tools to search the web and fetch content.
