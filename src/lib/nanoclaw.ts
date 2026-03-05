@@ -37,6 +37,7 @@ function ensureDirs(userId: string) {
   fs.mkdirSync(path.join(ipcDir, "messages"), { recursive: true });
   fs.mkdirSync(path.join(ipcDir, "tasks"), { recursive: true });
   fs.mkdirSync(path.join(ipcDir, "input"), { recursive: true });
+  fs.mkdirSync(path.join(ipcDir, "data"), { recursive: true });
   fs.mkdirSync(sessionDir, { recursive: true });
 
   // Create CLAUDE.md if it doesn't exist (agent memory)
@@ -87,6 +88,24 @@ IMPORTANT: When the user asks you to build, create, or generate any web project 
 3. ALWAYS return the live URL to the user so they can see their project
 
 If deployment fails, debug and retry. The user expects a live link.
+
+## Tracking Resources
+
+IMPORTANT: After creating Stripe resources or deploying to Vercel, you MUST write a tracking file so the dashboard can display the data.
+
+### After Stripe Operations
+After creating a product, price, or payment link, write a tracking file:
+\`\`\`bash
+echo '{"type":"track_payment","stripe_payment_id":"pl_xxx","product_name":"Product Name","amount":4900,"currency":"usd","payment_link_url":"https://buy.stripe.com/xxx","payment_type":"one_time"}' > /workspace/ipc/data/$(date +%s)-payment.json
+\`\`\`
+Replace the values with the actual Stripe IDs, product name, amount in cents, and payment link URL.
+
+### After Vercel Deployments
+After a successful deployment, write a tracking file:
+\`\`\`bash
+echo '{"type":"track_deployment","url":"https://project.vercel.app","project_name":"project-name"}' > /workspace/ipc/data/$(date +%s)-deploy.json
+\`\`\`
+Replace the URL and project name with the actual deployment values.
 
 ## Available Skills
 

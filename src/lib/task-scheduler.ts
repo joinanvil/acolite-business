@@ -8,6 +8,8 @@ import {
   getScheduledTasksForUser,
   updateTaskStatus,
   deleteScheduledTask,
+  createPayment,
+  upsertDeployment,
   type ScheduledTask,
 } from "./db";
 
@@ -208,6 +210,72 @@ async function processIpcTasks(): Promise<void> {
 }
 
 /**
+ * Process IPC data files from containers (resource tracking events)
+ */
+async function processIpcData(): Promise<void> {
+  try {
+    if (!fs.existsSync(GROUPS_DIR)) return;
+
+    const groups = fs.readdirSync(GROUPS_DIR).filter((f) => {
+      const stat = fs.statSync(path.join(GROUPS_DIR, f));
+      return stat.isDirectory();
+    });
+
+    for (const userId of groups) {
+      const dataDir = path.join(GROUPS_DIR, userId, "ipc", "data");
+      if (!fs.existsSync(dataDir)) continue;
+
+      const files = fs.readdirSync(dataDir).filter((f) => f.endsWith(".json"));
+
+      for (const file of files) {
+        const filePath = path.join(dataDir, file);
+        try {
+          const content = fs.readFileSync(filePath, "utf-8");
+          const data = JSON.parse(content);
+
+          if (data.type === "track_payment") {
+            logScheduler(`Tracking payment for ${userId}: ${data.product_name || data.stripe_payment_id}`);
+            await createPayment(
+              userId,
+              data.stripe_payment_id || `unknown-${Date.now()}`,
+              data.amount || 0,
+              data.currency || "usd",
+              {
+                stripeProductId: data.stripe_product_id,
+                stripePriceId: data.stripe_price_id,
+                paymentLinkUrl: data.payment_link_url,
+                productName: data.product_name,
+                type: data.payment_type === "subscription" ? "subscription" : "one_time",
+              }
+            );
+          } else if (data.type === "track_deployment") {
+            logScheduler(`Tracking deployment for ${userId}: ${data.url}`);
+            await upsertDeployment(userId, data.url, {
+              projectName: data.project_name,
+              vercelProjectId: data.vercel_project_id,
+              framework: data.framework,
+            });
+          } else {
+            logScheduler(`Unknown data type: ${data.type}`);
+          }
+
+          fs.unlinkSync(filePath);
+        } catch (err) {
+          logScheduler(`Error processing data file ${file}: ${err}`);
+          try {
+            fs.unlinkSync(filePath);
+          } catch {
+            // Ignore
+          }
+        }
+      }
+    }
+  } catch (err) {
+    logScheduler(`Error in processIpcData: ${err}`);
+  }
+}
+
+/**
  * Execute due tasks
  */
 async function executeDueTasks(): Promise<void> {
@@ -273,6 +341,9 @@ async function schedulerLoop(): Promise<void> {
 
     // Process IPC message files (send_message calls)
     await processIpcMessages();
+
+    // Process IPC data files (resource tracking)
+    await processIpcData();
 
     // Execute due tasks
     await executeDueTasks();

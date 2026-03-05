@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/button";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Chat } from "@/components/chat";
 import { Mailboxes } from "@/components/mailboxes";
+import { BusinessOverview } from "@/components/business-overview";
 
 export default function DashboardPage() {
   const { data: session, isPending } = useSession();
@@ -61,6 +62,8 @@ export default function DashboardPage() {
             with your personal NanoClaw assistant below.
           </p>
         </div>
+
+        <BusinessOverview />
 
         {/* Chat Interface */}
         <div className="grid gap-6 lg:grid-cols-3">
