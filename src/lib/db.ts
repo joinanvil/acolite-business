@@ -410,3 +410,45 @@ export async function deleteMailbox(id: string, userId: string): Promise<boolean
 
   return result.rowsAffected > 0;
 }
+
+// Research Reports
+
+export interface ResearchReport {
+  id: string;
+  title: string;
+  preview: string;
+  created_at: string;
+}
+
+export async function getResearchReports(userId: string, limit: number = 5): Promise<ResearchReport[]> {
+  await initDb();
+  const result = await client.execute({
+    sql: `SELECT id, content, created_at FROM nanoclaw_messages
+          WHERE user_id = ? AND role = 'assistant'
+          AND (content LIKE '%# Market Research%'
+            OR content LIKE '%## Executive Summary%'
+            OR content LIKE '%## Market Analysis%'
+            OR content LIKE '%## Competitor Analysis%')
+          ORDER BY created_at DESC
+          LIMIT ?`,
+    args: [userId, limit],
+  });
+
+  return result.rows.map((row) => {
+    const content = row.content as string;
+    const titleMatch = content.match(/^#\s+(.+)$/m);
+    const title = titleMatch ? titleMatch[1] : "Research Report";
+    const preview = content
+      .replace(/^#.+$/m, "")
+      .replace(/[#*_`]/g, "")
+      .trim()
+      .slice(0, 150);
+
+    return {
+      id: row.id as string,
+      title,
+      preview,
+      created_at: row.created_at as string,
+    };
+  });
+}

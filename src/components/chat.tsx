@@ -5,6 +5,7 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Send, Trash2, Bot, User, Loader2, Circle } from "lucide-react";
+import { cn } from "@/lib/utils";
 
 interface Message {
   id: string;
@@ -13,7 +14,7 @@ interface Message {
   created_at: string;
 }
 
-export function Chat() {
+export function Chat({ className }: { className?: string } = {}) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -151,7 +152,7 @@ export function Chat() {
   };
 
   return (
-    <div className="flex flex-col h-[600px] bg-white rounded-lg border shadow-sm">
+    <div className={cn("flex flex-col h-[600px] bg-white rounded-lg border shadow-sm", className)}>
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b">
         <div className="flex items-center gap-2">
