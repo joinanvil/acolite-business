@@ -70,6 +70,24 @@ export async function initDb() {
     ON nanoclaw_scheduled_tasks(status, next_run)
   `);
 
+  // Mailboxes table for email inboxes
+  await client.execute(`
+    CREATE TABLE IF NOT EXISTS nanoclaw_mailboxes (
+      id TEXT PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      email TEXT NOT NULL,
+      username TEXT NOT NULL,
+      inbox_id TEXT NOT NULL,
+      display_name TEXT,
+      created_at TEXT DEFAULT (datetime('now'))
+    )
+  `);
+
+  await client.execute(`
+    CREATE INDEX IF NOT EXISTS idx_nanoclaw_mailboxes_user_id
+    ON nanoclaw_mailboxes(user_id)
+  `);
+
   initialized = true;
 }
 
@@ -299,4 +317,96 @@ export async function deleteScheduledTask(taskId: string): Promise<void> {
     sql: `DELETE FROM nanoclaw_scheduled_tasks WHERE id = ?`,
     args: [taskId],
   });
+}
+
+// Mailboxes
+
+export interface Mailbox {
+  id: string;
+  user_id: string;
+  email: string;
+  username: string;
+  inbox_id: string;
+  display_name: string | null;
+  created_at: string;
+}
+
+export async function createMailbox(
+  userId: string,
+  email: string,
+  username: string,
+  inboxId: string,
+  displayName?: string
+): Promise<Mailbox> {
+  await initDb();
+  const id = crypto.randomUUID();
+  const created_at = new Date().toISOString();
+
+  await client.execute({
+    sql: `INSERT INTO nanoclaw_mailboxes (id, user_id, email, username, inbox_id, display_name, created_at)
+          VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    args: [id, userId, email, username, inboxId, displayName ?? null, created_at],
+  });
+
+  return {
+    id,
+    user_id: userId,
+    email,
+    username,
+    inbox_id: inboxId,
+    display_name: displayName ?? null,
+    created_at,
+  };
+}
+
+export async function getMailboxes(userId: string): Promise<Mailbox[]> {
+  await initDb();
+  const result = await client.execute({
+    sql: `SELECT * FROM nanoclaw_mailboxes WHERE user_id = ? ORDER BY created_at DESC`,
+    args: [userId],
+  });
+
+  return result.rows.map((row) => ({
+    id: row.id as string,
+    user_id: row.user_id as string,
+    email: row.email as string,
+    username: row.username as string,
+    inbox_id: row.inbox_id as string,
+    display_name: row.display_name as string | null,
+    created_at: row.created_at as string,
+  }));
+}
+
+export async function getMailboxByInboxId(
+  userId: string,
+  inboxId: string
+): Promise<Mailbox | null> {
+  await initDb();
+  const result = await client.execute({
+    sql: `SELECT * FROM nanoclaw_mailboxes WHERE user_id = ? AND inbox_id = ?`,
+    args: [userId, inboxId],
+  });
+
+  if (result.rows.length === 0) return null;
+
+  const row = result.rows[0];
+  return {
+    id: row.id as string,
+    user_id: row.user_id as string,
+    email: row.email as string,
+    username: row.username as string,
+    inbox_id: row.inbox_id as string,
+    display_name: row.display_name as string | null,
+    created_at: row.created_at as string,
+  };
+}
+
+export async function deleteMailbox(id: string, userId: string): Promise<boolean> {
+  await initDb();
+  const result = await client.execute({
+    sql: `DELETE FROM nanoclaw_mailboxes WHERE id = ? AND user_id = ?`,
+    args: [id, userId],
+  });
+
+  return result.rowsAffected > 0;
 }

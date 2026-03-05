@@ -94,6 +94,7 @@ You have access to specialized skills in /workspace/skills/. When a task matches
 
 Current skills:
 - **market-research**: Comprehensive market research, competitor analysis, pricing research, market sizing
+- **agentmail**: Create email inboxes, send and receive emails via the AgentMail API
 
 To use a skill, read its SKILL.md file first:
 \`\`\`
@@ -213,6 +214,7 @@ async function startContainer(userId: string, initialPrompt: string): Promise<Co
       HUNTER_API_KEY: process.env.HUNTER_API_KEY || "",
       STRIPE_API_KEY: process.env.STRIPE_API_KEY || "",
       VERCEL_TOKEN: process.env.VERCEL_TOKEN || "",
+      AGENTMAIL_API_KEY: process.env.AGENTMAIL_API_KEY || "",
     },
   };
 

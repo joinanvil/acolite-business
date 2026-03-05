@@ -6,6 +6,7 @@ import { useSession, signOut } from "@/lib/auth-client";
 import { Button } from "@/components/ui/button";
 import { Avatar, AvatarFallback, AvatarImage } from "@/components/ui/avatar";
 import { Chat } from "@/components/chat";
+import { Mailboxes } from "@/components/mailboxes";
 
 export default function DashboardPage() {
   const { data: session, isPending } = useSession();
@@ -68,6 +69,8 @@ export default function DashboardPage() {
           </div>
 
           <div className="space-y-4">
+            <Mailboxes />
+
             <div className="bg-white rounded-lg border p-4">
               <h3 className="font-medium mb-2">About Your Assistant</h3>
               <p className="text-sm text-gray-600">
