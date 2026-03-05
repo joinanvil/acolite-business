@@ -8,7 +8,8 @@ import { SubtaskList } from "./subtask-list";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import { ScrollArea } from "@/components/ui/scroll-area";
-import { Loader2, Trash2, XCircle } from "lucide-react";
+import { Loader2, Play, Trash2, XCircle } from "lucide-react";
+import { useState } from "react";
 
 function formatDate(dateStr: string | null) {
   if (!dateStr) return "—";
@@ -25,6 +26,26 @@ export function TaskDetail({
   onRefreshList: () => void;
 }) {
   const { task, subtasks, logs, isLoading, error } = useTaskDetail(taskId);
+  const [isExecuting, setIsExecuting] = useState(false);
+
+  const handleExecute = async () => {
+    setIsExecuting(true);
+    try {
+      const res = await fetch(`/api/tasks/${taskId}/execute`, {
+        method: "POST",
+        credentials: "include",
+      });
+      if (!res.ok) {
+        const data = await res.json();
+        console.error("Execute failed:", data.error);
+      }
+      onRefreshList();
+    } catch (err) {
+      console.error("Execute error:", err);
+    } finally {
+      setIsExecuting(false);
+    }
+  };
 
   const handleCancel = async () => {
     await fetch(`/api/tasks/${taskId}`, {
@@ -61,6 +82,7 @@ export function TaskDetail({
     );
   }
 
+  const canExecute = ["todo", "queued"].includes(task.status) && !!task.prompt;
   const canCancel = ["todo", "queued", "in_progress"].includes(task.status);
   const canDelete = ["completed", "cancelled", "failed"].includes(task.status);
 
@@ -72,6 +94,16 @@ export function TaskDetail({
           <div className="flex items-start justify-between gap-2">
             <h2 className="text-lg font-semibold">{task.title}</h2>
             <div className="flex gap-1 shrink-0">
+              {canExecute && (
+                <Button variant="default" size="sm" onClick={handleExecute} disabled={isExecuting}>
+                  {isExecuting ? (
+                    <Loader2 className="h-4 w-4 mr-1 animate-spin" />
+                  ) : (
+                    <Play className="h-4 w-4 mr-1" />
+                  )}
+                  Run Now
+                </Button>
+              )}
               {canCancel && (
                 <Button variant="ghost" size="sm" onClick={handleCancel}>
                   <XCircle className="h-4 w-4 mr-1" />

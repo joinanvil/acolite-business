@@ -1,7 +1,8 @@
 import { createClient } from "@libsql/client";
 import path from "path";
 
-const dbPath = `file:${path.join(process.cwd(), "prisma", "dev.db")}`;
+const dbPath = process.env.NANOCLAW_DB_URL
+  || `file:${path.join(process.cwd(), "prisma", "dev.db")}`;
 
 export const client = createClient({
   url: dbPath,

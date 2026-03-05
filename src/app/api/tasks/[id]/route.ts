@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { headers } from "next/headers";
-import { getTask, getSubtasks, getTaskLogs, updateTask, transitionTaskStatus, deleteTask } from "@/lib/task-queue";
+import { getTask, getSubtasks, getTaskLogs, updateTask, transitionTaskStatus, deleteTask, VALID_TEAMS, type TeamAgent } from "@/lib/task-queue";
 
 export async function GET(_request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
@@ -38,10 +38,15 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
     if (body.status === "cancelled") {
       await transitionTaskStatus(id, "cancelled");
     } else {
+      const assignedTo = body.assigned_to as TeamAgent | undefined;
+      if (assignedTo && !VALID_TEAMS.includes(assignedTo)) {
+        return NextResponse.json({ error: `Invalid team: ${assignedTo}` }, { status: 400 });
+      }
       await updateTask(id, {
         title: body.title,
         description: body.description,
         priority: body.priority,
+        assigned_to: assignedTo,
       });
     }
 

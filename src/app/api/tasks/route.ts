@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { headers } from "next/headers";
-import { listTasks, createTask, type TaskStatus, type TaskPriority } from "@/lib/task-queue";
+import { listTasks, createTask, type TaskStatus, type TaskPriority, type TeamAgent, VALID_TEAMS } from "@/lib/task-queue";
 
 export async function GET(request: NextRequest) {
   try {
@@ -11,6 +11,7 @@ export async function GET(request: NextRequest) {
     const params = request.nextUrl.searchParams;
     const status = params.get("status") as TaskStatus | null;
     const priority = params.get("priority") as TaskPriority | null;
+    const assigned_to = params.get("assigned_to") as TeamAgent | null;
     const parentTaskId = params.get("parent_task_id");
     const includeCompleted = params.get("include_completed") === "true";
     const limit = parseInt(params.get("limit") || "50", 10);
@@ -19,6 +20,7 @@ export async function GET(request: NextRequest) {
     const tasks = await listTasks(session.user.id, {
       status: status || undefined,
       priority: priority || undefined,
+      assigned_to: assigned_to || undefined,
       parentTaskId: parentTaskId === "root" ? null : parentTaskId || undefined,
       includeCompleted,
       limit,
@@ -51,6 +53,12 @@ export async function POST(request: NextRequest) {
       }
     }
 
+    // Validate assigned_to if provided
+    const assignedTo = body.assigned_to as TeamAgent | undefined;
+    if (assignedTo && !VALID_TEAMS.includes(assignedTo)) {
+      return NextResponse.json({ error: `Invalid team: ${assignedTo}. Valid: ${VALID_TEAMS.join(", ")}` }, { status: 400 });
+    }
+
     const task = await createTask({
       user_id: session.user.id,
       title: body.title,
@@ -58,6 +66,7 @@ export async function POST(request: NextRequest) {
       description: body.description,
       priority: body.priority || "normal",
       created_by: "human",
+      assigned_to: assignedTo,
       parent_task_id: body.parent_task_id,
       schedule_type: body.schedule_type,
       schedule_value: body.schedule_value,

@@ -28,6 +28,16 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { CreateTaskDialog } from "@/components/tasks/create-task-dialog";
+import { TaskDetailModal } from "@/components/tasks/task-detail-modal";
+import { TaskStatusBadge } from "@/components/tasks/task-status-badge";
+import { TaskPriorityBadge } from "@/components/tasks/task-priority-badge";
+
+const TEAM_LABELS: Record<string, string> = {
+  "general-manager": "GM",
+  engineering: "Eng",
+  product: "Product",
+  marketing: "Marketing",
+};
 
 function timeAgo(dateString: string) {
   const now = new Date();
@@ -45,8 +55,10 @@ function timeAgo(dateString: string) {
 export default function DashboardPage() {
   const { data: session, isPending } = useSession();
   const router = useRouter();
-  const { tasks } = useTasks({ parentTaskId: null });
+  const { tasks } = useTasks({ parentTaskId: null, includeCompleted: true });
   const [showCreateTask, setShowCreateTask] = useState(false);
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
+  const [showAllTasks, setShowAllTasks] = useState(false);
   const [websiteUrl, setWebsiteUrl] = useState("");
   const [editingWebsite, setEditingWebsite] = useState(false);
   const [websiteInput, setWebsiteInput] = useState("");
@@ -101,7 +113,12 @@ export default function DashboardPage() {
     (t) => t.status === "in_progress" || t.status === "queued"
   );
   const recentTasks = tasks.slice(0, 6);
-  const lastActivity = tasks.length > 0 ? tasks[0] : null;
+  const lastActivity = tasks.length > 0
+    ? [...tasks].sort((a, b) =>
+        new Date(b.updated_at || b.created_at).getTime() -
+        new Date(a.updated_at || a.created_at).getTime()
+      )[0]
+    : null;
 
   return (
     <div className="min-h-screen bg-white">
@@ -265,10 +282,11 @@ export default function DashboardPage() {
                     No tasks yet. Create one to get started.
                   </p>
                 ) : (
-                  recentTasks.map((task) => (
-                    <div
+                  (showAllTasks ? tasks : recentTasks).map((task) => (
+                    <button
                       key={task.id}
-                      className="bg-gray-900 text-white rounded-lg p-4"
+                      onClick={() => setSelectedTaskId(task.id)}
+                      className="w-full text-left bg-gray-900 text-white rounded-lg p-4 hover:bg-gray-800 transition-colors"
                     >
                       <h3 className="font-medium text-sm leading-snug">
                         {task.title}
@@ -278,16 +296,16 @@ export default function DashboardPage() {
                           {task.description}
                         </p>
                       )}
-                      <div className="flex items-center gap-2 mt-3">
-                        <span className="text-xs bg-gray-700 text-gray-300 px-2 py-0.5 rounded">
-                          {task.status === "in_progress"
-                            ? "Running"
-                            : task.status === "queued"
-                              ? "Queued"
-                              : task.status === "completed"
-                                ? "Done"
-                                : task.status}
-                        </span>
+                      <div className="flex items-center gap-2 mt-3 flex-wrap">
+                        <TaskStatusBadge status={task.status} />
+                        {task.priority !== "normal" && (
+                          <TaskPriorityBadge priority={task.priority} />
+                        )}
+                        {task.assigned_to && (
+                          <span className="text-xs bg-gray-700 text-gray-300 px-2 py-0.5 rounded">
+                            {TEAM_LABELS[task.assigned_to] || task.assigned_to}
+                          </span>
+                        )}
                         {task.schedule_type &&
                           task.schedule_type != null && (
                             <span className="text-xs bg-gray-700 text-gray-300 px-2 py-0.5 rounded flex items-center gap-1">
@@ -301,14 +319,33 @@ export default function DashboardPage() {
                             </span>
                           )}
                       </div>
-                    </div>
+                      <div className="mt-3 flex items-center justify-between">
+                        <span className="text-xs text-gray-400">
+                          {timeAgo(task.updated_at || task.created_at)}
+                        </span>
+                        <span className="text-xs text-gray-400 hover:text-white">
+                          View →
+                        </span>
+                      </div>
+                    </button>
                   ))
                 )}
               </div>
-              {tasks.length > 6 && (
-                <p className="text-sm text-gray-500 mt-3 cursor-pointer hover:text-gray-700">
+              {tasks.length > 6 && !showAllTasks && (
+                <button
+                  onClick={() => setShowAllTasks(true)}
+                  className="text-sm text-gray-500 mt-3 hover:text-gray-700"
+                >
                   View all {tasks.length} tasks →
-                </p>
+                </button>
+              )}
+              {showAllTasks && tasks.length > 6 && (
+                <button
+                  onClick={() => setShowAllTasks(false)}
+                  className="text-sm text-gray-500 mt-3 hover:text-gray-700"
+                >
+                  Show fewer
+                </button>
               )}
             </section>
 
@@ -371,6 +408,15 @@ export default function DashboardPage() {
         onOpenChange={setShowCreateTask}
         onCreated={() => {}}
       />
+
+      {/* Task Detail Modal */}
+      {selectedTaskId && (
+        <TaskDetailModal
+          taskId={selectedTaskId}
+          onClose={() => setSelectedTaskId(null)}
+          onDeleted={() => setSelectedTaskId(null)}
+        />
+      )}
     </div>
   );
 }

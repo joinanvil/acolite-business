@@ -2,10 +2,9 @@ import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
 import { headers } from "next/headers";
 import { createNanoClaw } from "@/lib/nanoclaw";
-import { getMessages, clearMessages } from "@/lib/db";
+import { getMessages, clearMessages, addMessage } from "@/lib/db";
 import { getPendingMessages } from "@/lib/task-scheduler";
 
-// Get chat history and container status
 export async function GET(request: NextRequest) {
   try {
     const session = await auth.api.getSession({
@@ -19,13 +18,14 @@ export async function GET(request: NextRequest) {
     const messages = await getMessages(session.user.id);
     const nanoclaw = createNanoClaw(session.user.id);
     const hasActiveContainer = nanoclaw.hasActiveContainer();
+    const isBusy = nanoclaw.isBusy();
 
-    // Get any pending messages from scheduled tasks
     const pendingMessages = getPendingMessages(session.user.id);
 
     return NextResponse.json({
       messages,
       hasActiveContainer,
+      isBusy,
       pendingMessages,
     });
   } catch (error) {
@@ -37,7 +37,6 @@ export async function GET(request: NextRequest) {
   }
 }
 
-// Send a message and stream the response
 export async function POST(request: NextRequest) {
   try {
     const session = await auth.api.getSession({
@@ -53,14 +52,12 @@ export async function POST(request: NextRequest) {
 
     const nanoclaw = createNanoClaw(session.user.id);
 
-    // Handle clear action
     if (action === "clear") {
       await clearMessages(session.user.id);
-      await nanoclaw.stopContainer(); // Also stop container when clearing
+      await nanoclaw.stopContainer();
       return NextResponse.json({ success: true });
     }
 
-    // Handle stop container action
     if (action === "stop") {
       await nanoclaw.stopContainer();
       return NextResponse.json({ success: true });
@@ -73,32 +70,22 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Stream the response
-    const stream = await nanoclaw.streamChat(message);
+    // Save user message immediately so the UI can display it
+    await addMessage(session.user.id, "user", message);
 
-    const encoder = new TextEncoder();
-    const readable = new ReadableStream({
-      async start(controller) {
-        try {
-          for await (const event of stream) {
-            const data = JSON.stringify(event) + "\n";
-            controller.enqueue(encoder.encode(`data: ${data}\n`));
-          }
-          controller.close();
-        } catch (error) {
-          console.error("Stream error:", error);
-          controller.error(error);
-        }
-      },
+    // Execute directly against the container in the background.
+    // No task is created — chat messages are just conversations.
+    // The agent can explicitly create tasks via its create_task MCP tool.
+    nanoclaw.executeForTask(message).catch(async (err) => {
+      console.error("Chat execution error:", err);
+      await addMessage(
+        session.user.id,
+        "assistant",
+        "Sorry, I encountered an error processing your message.",
+      );
     });
 
-    return new Response(readable, {
-      headers: {
-        "Content-Type": "text/event-stream",
-        "Cache-Control": "no-cache",
-        Connection: "keep-alive",
-      },
-    });
+    return NextResponse.json({ status: "processing" });
   } catch (error) {
     console.error("POST /api/chat error:", error);
     return NextResponse.json(

@@ -2,6 +2,9 @@ export type TaskStatus = "todo" | "queued" | "in_progress" | "completed" | "canc
 export type TaskPriority = "urgent" | "high" | "normal" | "low";
 export type TaskCreatedBy = "human" | "agent" | "trigger";
 export type TaskScheduleType = "once" | "interval" | "cron";
+export type TeamAgent = "general-manager" | "engineering" | "product" | "marketing";
+
+export const VALID_TEAMS: TeamAgent[] = ["general-manager", "engineering", "product", "marketing"];
 
 export interface Task {
   id: string;
@@ -12,6 +15,7 @@ export interface Task {
   status: TaskStatus;
   priority: TaskPriority;
   created_by: TaskCreatedBy;
+  assigned_to: TeamAgent | null;
   parent_task_id: string | null;
   depth: number;
   trigger_id: string | null;
@@ -36,6 +40,7 @@ export interface CreateTaskInput {
   status?: TaskStatus;
   priority?: TaskPriority;
   created_by?: TaskCreatedBy;
+  assigned_to?: TeamAgent;
   parent_task_id?: string;
   trigger_id?: string;
   schedule_type?: TaskScheduleType;
@@ -50,6 +55,7 @@ export interface UpdateTaskInput {
   prompt?: string;
   status?: TaskStatus;
   priority?: TaskPriority;
+  assigned_to?: TeamAgent | null;
   schedule_type?: TaskScheduleType;
   schedule_value?: string;
   next_run?: Date | null;

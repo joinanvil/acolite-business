@@ -1,5 +1,6 @@
 import { spawn, ChildProcess } from "child_process";
 import fs from "fs";
+import fsPromises from "fs/promises";
 import path from "path";
 import {
   addMessage,
@@ -14,7 +15,6 @@ const CONTAINER_TIMEOUT = 300000; // 5 minutes per message
 const GROUPS_DIR = path.join(process.cwd(), "nanoclaw-data", "groups");
 const SESSIONS_DIR = path.join(process.cwd(), "nanoclaw-data", "sessions");
 
-// Registry of active containers per user
 interface ContainerInfo {
   process: ChildProcess;
   containerName: string;
@@ -22,12 +22,13 @@ interface ContainerInfo {
   ipcDir: string;
   lastActivity: number;
   pendingResponses: Map<string, (response: string) => void>;
+  streamListeners: Map<string, (chunk: string) => void>;
   outputBuffer: string;
+  busyCount: number;
 }
 
 const activeContainers = new Map<string, ContainerInfo>();
 
-// Ensure directories exist
 function ensureDirs(userId: string) {
   const groupDir = path.join(GROUPS_DIR, userId);
   const sessionDir = path.join(SESSIONS_DIR, userId, ".claude");
@@ -40,7 +41,6 @@ function ensureDirs(userId: string) {
   fs.mkdirSync(path.join(ipcDir, "data"), { recursive: true });
   fs.mkdirSync(sessionDir, { recursive: true });
 
-  // Create CLAUDE.md if it doesn't exist (agent memory)
   const claudeMd = path.join(groupDir, "CLAUDE.md");
   if (!fs.existsSync(claudeMd)) {
     fs.writeFileSync(
@@ -194,14 +194,10 @@ function formatMessagesAsXml(messages: Message[]): string {
 const START_MARKER = "---NANOCLAW_OUTPUT_START---";
 const END_MARKER = "---NANOCLAW_OUTPUT_END---";
 
-/**
- * Check if a container is running for a user
- */
 function isContainerRunning(userId: string): boolean {
   const info = activeContainers.get(userId);
   if (!info) return false;
 
-  // Check if process is still alive
   if (info.process.killed || info.process.exitCode !== null) {
     activeContainers.delete(userId);
     return false;
@@ -211,93 +207,34 @@ function isContainerRunning(userId: string): boolean {
 }
 
 /**
- * Start a persistent container for a user
+ * Check if a Docker container with this name is already running (survives server restarts).
  */
-async function startContainer(userId: string, initialPrompt: string): Promise<ContainerInfo> {
-  const { groupDir, sessionDir, ipcDir } = ensureDirs(userId);
-
-  // Get existing session
-  const session = await getSession(userId);
-
-  const containerName = `nanoclaw-${userId.slice(0, 12)}`;
-
-  // Check if container already exists (maybe from a previous run)
-  try {
-    const existing = await new Promise<string>((resolve) => {
-      const check = spawn("docker", ["ps", "-aq", "-f", `name=${containerName}`]);
-      let output = "";
-      check.stdout.on("data", (d) => output += d.toString());
-      check.on("close", () => resolve(output.trim()));
-    });
-
-    if (existing) {
-      // Remove the old container
-      await new Promise<void>((resolve) => {
-        const rm = spawn("docker", ["rm", "-f", containerName]);
-        rm.on("close", () => resolve());
-      });
-    }
-  } catch {
-    // Ignore errors
-  }
-
-  const containerInput: ContainerInput = {
-    prompt: initialPrompt,
-    sessionId: session?.session_id || undefined,
-    groupFolder: userId,
-    chatJid: `web:${userId}`,
-    isMain: false,
-    assistantName: "NanoClaw",
-    secrets: {
-      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || "",
-      HUNTER_API_KEY: process.env.HUNTER_API_KEY || "",
-      STRIPE_API_KEY: process.env.STRIPE_API_KEY || "",
-      VERCEL_TOKEN: process.env.VERCEL_TOKEN || "",
-      AGENTMAIL_API_KEY: process.env.AGENTMAIL_API_KEY || "",
-    },
-  };
-
-  // Skills directory
-  const skillsDir = path.join(process.cwd(), "skills");
-
-  // Docker run command - persistent container
-  const args = [
-    "run",
-    "-i",
-    "--name", containerName,
-    // Mount group folder (includes IPC directory)
-    "-v", `${groupDir}:/workspace/group`,
-    // Mount IPC directory explicitly
-    "-v", `${ipcDir}:/workspace/ipc`,
-    // Mount session folder
-    "-v", `${sessionDir}:/home/node/.claude`,
-    // Mount skills directory
-    "-v", `${skillsDir}:/workspace/skills:ro`,
-    CONTAINER_IMAGE,
-  ];
-
-  console.log(`[NanoClaw] Starting container for user ${userId}: ${containerName}`);
-
-  const proc = spawn("docker", args, {
-    stdio: ["pipe", "pipe", "pipe"],
+async function isDockerContainerAlive(containerName: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const check = spawn("docker", ["ps", "-q", "-f", `name=^${containerName}$`, "-f", "status=running"]);
+    let output = "";
+    check.stdout.on("data", (d) => (output += d.toString()));
+    check.on("close", () => resolve(output.trim().length > 0));
+    check.on("error", () => resolve(false));
   });
+}
 
-  const info: ContainerInfo = {
-    process: proc,
-    containerName,
-    groupDir,
-    ipcDir,
-    lastActivity: Date.now(),
-    pendingResponses: new Map(),
-    outputBuffer: "",
-  };
+/**
+ * Remove a stopped/dead container so the name can be reused.
+ */
+async function removeDeadContainer(containerName: string): Promise<void> {
+  return new Promise((resolve) => {
+    const rm = spawn("docker", ["rm", "-f", containerName]);
+    rm.on("close", () => resolve());
+    rm.on("error", () => resolve());
+  });
+}
 
-  // Handle stdout - parse output markers
-  proc.stdout.on("data", (chunk: Buffer) => {
+function setupOutputHandler(userId: string, info: ContainerInfo) {
+  info.process.stdout!.on("data", (chunk: Buffer) => {
     info.outputBuffer += chunk.toString();
     info.lastActivity = Date.now();
 
-    // Process complete outputs
     while (true) {
       const startIdx = info.outputBuffer.indexOf(START_MARKER);
       if (startIdx === -1) break;
@@ -315,18 +252,20 @@ async function startContainer(userId: string, initialPrompt: string): Promise<Co
       try {
         const output: ContainerOutput = JSON.parse(jsonStr);
 
-        // Update session if we got a new one
         if (output.newSessionId) {
           upsertSession(userId, output.newSessionId);
         }
 
-        // If we have a result with content, resolve the pending response
         if (output.result) {
           const text = output.result
             .replace(/<internal>[\s\S]*?<\/internal>/g, "")
             .trim();
 
           if (text) {
+            // Notify stream listeners with partial content
+            for (const listener of info.streamListeners.values()) {
+              listener(text);
+            }
             // Resolve the oldest pending response
             const [firstKey] = info.pendingResponses.keys();
             if (firstKey) {
@@ -351,29 +290,92 @@ async function startContainer(userId: string, initialPrompt: string): Promise<Co
     }
   });
 
-  proc.stderr.on("data", (data: Buffer) => {
+  info.process.stderr!.on("data", (data: Buffer) => {
     console.error(`[NanoClaw ${userId}]`, data.toString());
   });
 
-  proc.on("close", (code) => {
+  info.process.on("close", (code) => {
     console.log(`[NanoClaw] Container for user ${userId} exited with code ${code}`);
     activeContainers.delete(userId);
 
-    // Reject any pending responses
     for (const [, resolver] of info.pendingResponses) {
       resolver("Container exited unexpectedly");
     }
     info.pendingResponses.clear();
+    info.streamListeners.clear();
   });
 
-  proc.on("error", (err) => {
+  info.process.on("error", (err) => {
     console.error(`[NanoClaw] Container error for user ${userId}:`, err);
     activeContainers.delete(userId);
   });
+}
 
-  // Write initial input
-  proc.stdin.write(JSON.stringify(containerInput));
-  proc.stdin.end();
+async function startContainer(userId: string, initialPrompt: string): Promise<ContainerInfo> {
+  const { groupDir, sessionDir, ipcDir } = ensureDirs(userId);
+  const session = await getSession(userId);
+  const containerName = `nanoclaw-${userId.slice(0, 12)}`;
+
+  // Only remove the container if it exists but is NOT running.
+  // If it's running, we have a bug — log a warning and kill it.
+  const alive = await isDockerContainerAlive(containerName);
+  if (alive) {
+    console.warn(`[NanoClaw] Container ${containerName} is already running but not tracked. Killing it.`);
+  }
+  // Remove regardless — either dead container or orphaned running one
+  await removeDeadContainer(containerName);
+
+  const containerInput: ContainerInput = {
+    prompt: initialPrompt,
+    sessionId: session?.session_id || undefined,
+    groupFolder: userId,
+    chatJid: `web:${userId}`,
+    isMain: false,
+    assistantName: "NanoClaw",
+    secrets: {
+      ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY || "",
+      HUNTER_API_KEY: process.env.HUNTER_API_KEY || "",
+      STRIPE_API_KEY: process.env.STRIPE_API_KEY || "",
+      VERCEL_TOKEN: process.env.VERCEL_TOKEN || "",
+      AGENTMAIL_API_KEY: process.env.AGENTMAIL_API_KEY || "",
+    },
+  };
+
+  const skillsDir = path.join(process.cwd(), "skills");
+
+  const args = [
+    "run",
+    "-i",
+    "--name", containerName,
+    "-v", `${groupDir}:/workspace/group`,
+    "-v", `${ipcDir}:/workspace/ipc`,
+    "-v", `${sessionDir}:/home/node/.claude`,
+    "-v", `${skillsDir}:/workspace/skills:ro`,
+    CONTAINER_IMAGE,
+  ];
+
+  console.log(`[NanoClaw] Starting container for user ${userId}: ${containerName}`);
+
+  const proc = spawn("docker", args, {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+
+  const info: ContainerInfo = {
+    process: proc,
+    containerName,
+    groupDir,
+    ipcDir,
+    lastActivity: Date.now(),
+    pendingResponses: new Map(),
+    streamListeners: new Map(),
+    outputBuffer: "",
+    busyCount: 0,
+  };
+
+  setupOutputHandler(userId, info);
+
+  proc.stdin!.write(JSON.stringify(containerInput));
+  proc.stdin!.end();
 
   activeContainers.set(userId, info);
 
@@ -381,28 +383,22 @@ async function startContainer(userId: string, initialPrompt: string): Promise<Co
 }
 
 /**
- * Send a message to an existing container via IPC
+ * Send a message to an existing container via IPC (async)
  */
-function sendIpcMessage(info: ContainerInfo, message: string): void {
+async function sendIpcMessage(info: ContainerInfo, message: string): Promise<void> {
   const timestamp = Date.now();
   const random = Math.random().toString(36).slice(2, 8);
   const filename = `${timestamp}-${random}.json`;
   const filepath = path.join(info.ipcDir, "input", filename);
 
-  const ipcMessage = {
-    type: "message",
-    text: message,
-  };
+  const ipcMessage = { type: "message", text: message };
 
-  fs.writeFileSync(filepath, JSON.stringify(ipcMessage));
+  await fsPromises.writeFile(filepath, JSON.stringify(ipcMessage));
   info.lastActivity = Date.now();
 
   console.log(`[NanoClaw] Sent IPC message: ${filename}`);
 }
 
-/**
- * Wait for a response from the container
- */
 function waitForResponse(info: ContainerInfo, messageId: string, timeout: number): Promise<string> {
   return new Promise((resolve) => {
     const timer = setTimeout(() => {
@@ -425,32 +421,30 @@ export class NanoClawService {
   }
 
   async chat(userMessage: string): Promise<NanoClawResponse> {
-    // Save user message
     await addMessage(this.userId, "user", userMessage);
 
-    // Get conversation history for context
     const history = await getMessages(this.userId);
     const prompt = formatMessagesAsXml(history);
 
     const messageId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     let response: string;
+    let info: ContainerInfo;
 
     if (isContainerRunning(this.userId)) {
-      // Container already running - send via IPC
-      const info = activeContainers.get(this.userId)!;
-
-      // Format just the new message for IPC
+      info = activeContainers.get(this.userId)!;
       const newMessageXml = `<message from="User" timestamp="${new Date().toISOString()}">\n${escapeXml(userMessage)}\n</message>`;
-
-      sendIpcMessage(info, newMessageXml);
-      response = await waitForResponse(info, messageId, CONTAINER_TIMEOUT);
+      await sendIpcMessage(info, newMessageXml);
     } else {
-      // Start new container with full history
-      const info = await startContainer(this.userId, prompt);
-      response = await waitForResponse(info, messageId, CONTAINER_TIMEOUT);
+      info = await startContainer(this.userId, prompt);
     }
 
-    // Save assistant response
+    info.busyCount++;
+    try {
+      response = await waitForResponse(info, messageId, CONTAINER_TIMEOUT);
+    } finally {
+      info.busyCount = Math.max(0, info.busyCount - 1);
+    }
+
     const savedMessage = await addMessage(this.userId, "assistant", response);
 
     return {
@@ -459,47 +453,151 @@ export class NanoClawService {
     };
   }
 
-  async streamChat(
+  /**
+   * Stream chat: yields partial content as the agent produces output,
+   * then a final "done" event. Falls back to single-yield if the container
+   * only emits one result block.
+   */
+  async *streamChat(
     userMessage: string
-  ): Promise<AsyncIterable<{ type: string; content?: string }>> {
-    const userId = this.userId;
+  ): AsyncGenerator<{ type: string; content?: string }> {
+    await addMessage(this.userId, "user", userMessage);
 
-    // Use the non-streaming chat for now, but wrap it in an async generator
-    async function* streamGenerator() {
-      const service = new NanoClawService(userId);
-      const result = await service.chat(userMessage);
-      yield { type: "text", content: result.content };
-      yield { type: "done" };
+    const history = await getMessages(this.userId);
+    const prompt = formatMessagesAsXml(history);
+
+    const messageId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    let info: ContainerInfo;
+
+    if (isContainerRunning(this.userId)) {
+      info = activeContainers.get(this.userId)!;
+      const newMessageXml = `<message from="User" timestamp="${new Date().toISOString()}">\n${escapeXml(userMessage)}\n</message>`;
+      await sendIpcMessage(info, newMessageXml);
+    } else {
+      info = await startContainer(this.userId, prompt);
     }
 
-    return streamGenerator();
+    info.busyCount++;
+
+    try {
+      // Collect chunks as they arrive via the stream listener
+      const chunks: string[] = [];
+      let done = false;
+      let finalResolve: (() => void) | null = null;
+
+      const streamId = messageId;
+
+      // Listen for partial output from the container's stdout parser
+      info.streamListeners.set(streamId, (text: string) => {
+        chunks.push(text);
+        finalResolve?.();
+      });
+
+      // Also register the pending response so we know when it's truly done
+      const responsePromise = new Promise<string>((resolve) => {
+        const timer = setTimeout(() => {
+          info.pendingResponses.delete(messageId);
+          done = true;
+          resolve("Request timed out");
+          finalResolve?.();
+        }, CONTAINER_TIMEOUT);
+
+        info.pendingResponses.set(messageId, (response: string) => {
+          clearTimeout(timer);
+          done = true;
+          resolve(response);
+          finalResolve?.();
+        });
+      });
+
+      // Yield chunks as they arrive
+      while (!done) {
+        if (chunks.length > 0) {
+          const chunk = chunks.shift()!;
+          yield { type: "text", content: chunk };
+        } else {
+          // Wait for next chunk or completion
+          await new Promise<void>((resolve) => {
+            finalResolve = resolve;
+            // Safety: if already done, resolve immediately
+            if (done || chunks.length > 0) resolve();
+          });
+        }
+      }
+
+      // Drain remaining chunks
+      while (chunks.length > 0) {
+        yield { type: "text", content: chunks.shift()! };
+      }
+
+      info.streamListeners.delete(streamId);
+
+      const response = await responsePromise;
+      await addMessage(this.userId, "assistant", response);
+
+      yield { type: "done" };
+    } finally {
+      info.busyCount = Math.max(0, info.busyCount - 1);
+      info.streamListeners.delete(messageId);
+    }
+  }
+
+  /**
+   * Execute a task's prompt against the container without saving the user message
+   * (it was already saved when the task was created). Returns the assistant response.
+   */
+  async executeForTask(prompt: string): Promise<NanoClawResponse> {
+    const history = await getMessages(this.userId);
+    const formattedHistory = formatMessagesAsXml(history);
+
+    const messageId = `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    let response: string;
+    let info: ContainerInfo;
+
+    if (isContainerRunning(this.userId)) {
+      info = activeContainers.get(this.userId)!;
+      const messageXml = `<message from="User" timestamp="${new Date().toISOString()}">\n${escapeXml(prompt)}\n</message>`;
+      await sendIpcMessage(info, messageXml);
+    } else {
+      info = await startContainer(this.userId, formattedHistory);
+    }
+
+    info.busyCount++;
+    try {
+      response = await waitForResponse(info, messageId, CONTAINER_TIMEOUT);
+    } finally {
+      info.busyCount = Math.max(0, info.busyCount - 1);
+    }
+
+    const savedMessage = await addMessage(this.userId, "assistant", response);
+
+    return {
+      content: response,
+      messageId: savedMessage.id,
+    };
   }
 
   async getHistory(): Promise<Message[]> {
     return getMessages(this.userId);
   }
 
-  /**
-   * Check if this user has an active container
-   */
   hasActiveContainer(): boolean {
     return isContainerRunning(this.userId);
   }
 
-  /**
-   * Stop the container for this user
-   */
+  isBusy(): boolean {
+    const info = activeContainers.get(this.userId);
+    return !!info && info.busyCount > 0;
+  }
+
   async stopContainer(): Promise<void> {
     const info = activeContainers.get(this.userId);
     if (info) {
-      // Send close sentinel
       const closePath = path.join(info.ipcDir, "input", "_close");
-      fs.writeFileSync(closePath, "");
+      await fsPromises.writeFile(closePath, "");
 
-      // Wait a bit for graceful shutdown
       await new Promise((resolve) => setTimeout(resolve, 1000));
 
-      // Force kill if still running
       if (!info.process.killed) {
         info.process.kill("SIGTERM");
       }
@@ -509,19 +607,17 @@ export class NanoClawService {
   }
 }
 
-// Factory function
 export function createNanoClaw(userId: string): NanoClawService {
   return new NanoClawService(userId);
 }
 
-// Cleanup function for graceful shutdown
 export async function cleanupAllContainers(): Promise<void> {
   console.log(`[NanoClaw] Cleaning up ${activeContainers.size} containers...`);
 
   for (const [userId, info] of activeContainers) {
     try {
       const closePath = path.join(info.ipcDir, "input", "_close");
-      fs.writeFileSync(closePath, "");
+      await fsPromises.writeFile(closePath, "");
       info.process.kill("SIGTERM");
     } catch (err) {
       console.error(`[NanoClaw] Error cleaning up container for ${userId}:`, err);
@@ -531,6 +627,5 @@ export async function cleanupAllContainers(): Promise<void> {
   activeContainers.clear();
 }
 
-// Handle process exit
 process.on("SIGTERM", cleanupAllContainers);
 process.on("SIGINT", cleanupAllContainers);

@@ -28,35 +28,63 @@ export function Chat() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [streamingContent, setStreamingContent] = useState("");
   const [hasActiveContainer, setHasActiveContainer] = useState(false);
+  const [hasPendingTask, setHasPendingTask] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const prevMessageCountRef = useRef(0);
 
-  // Load chat history on mount
-  useEffect(() => {
-    loadHistory();
-  }, []);
-
-  // Auto-scroll to bottom when messages change
-  useEffect(() => {
-    if (scrollRef.current) {
-      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
-    }
-  }, [messages, streamingContent]);
-
-  const loadHistory = async () => {
+  const loadHistory = useCallback(async () => {
     try {
       const response = await fetch("/api/chat");
       if (response.ok) {
         const data = await response.json();
-        setMessages(data.messages || []);
+        const newMessages = data.messages || [];
+        setMessages(newMessages);
         setHasActiveContainer(data.hasActiveContainer || false);
+
+        const busy = data.isBusy || false;
+        setHasPendingTask(busy);
+
+        // If the agent finished (not busy) and we have a new assistant message, stop loading
+        if (!busy && newMessages.length > 0) {
+          const lastMsg = newMessages[newMessages.length - 1];
+          if (lastMsg.role === "assistant") {
+            setIsLoading(false);
+          }
+        }
       }
     } catch (error) {
       console.error("Failed to load chat history:", error);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    loadHistory();
+  }, [loadHistory]);
+
+  // Poll faster when there's a pending task (waiting for response)
+  useEffect(() => {
+    const interval = setInterval(
+      loadHistory,
+      hasPendingTask || isLoading ? 2000 : hasActiveContainer ? 5000 : 10000,
+    );
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") loadHistory();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
+  }, [loadHistory, hasActiveContainer, hasPendingTask, isLoading]);
+
+  useEffect(() => {
+    if (scrollRef.current && messages.length > prevMessageCountRef.current) {
+      scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
+    }
+    prevMessageCountRef.current = messages.length;
+  }, [messages]);
 
   const handleSubmit = useCallback(
     async (e: React.FormEvent) => {
@@ -66,7 +94,6 @@ export function Chat() {
       const userMessage = input.trim();
       setInput("");
       setIsLoading(true);
-      setStreamingContent("");
 
       // Optimistically add user message
       const tempUserMessage: Message = {
@@ -88,48 +115,10 @@ export function Chat() {
           throw new Error("Failed to send message");
         }
 
-        const reader = response.body?.getReader();
-        if (!reader) throw new Error("No reader available");
-
-        const decoder = new TextDecoder();
-        let fullContent = "";
-
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-
-          const text = decoder.decode(value);
-          const lines = text.split("\n");
-
-          for (const line of lines) {
-            if (line.startsWith("data: ")) {
-              try {
-                const data = JSON.parse(line.slice(6));
-                if (data.type === "text" && data.content) {
-                  fullContent += data.content;
-                  setStreamingContent(fullContent);
-                } else if (data.type === "done") {
-                  // Add the complete assistant message
-                  const assistantMessage: Message = {
-                    id: `msg-${Date.now()}`,
-                    role: "assistant",
-                    content: fullContent,
-                    created_at: new Date().toISOString(),
-                  };
-                  setMessages((prev) => [...prev, assistantMessage]);
-                  setStreamingContent("");
-                }
-              } catch {
-                // Ignore parse errors for incomplete chunks
-              }
-            }
-          }
-        }
-        // Refresh container status after response
-        setHasActiveContainer(true);
+        await response.json();
+        setHasPendingTask(true);
       } catch (error) {
         console.error("Chat error:", error);
-        // Add error message
         const errorMessage: Message = {
           id: `error-${Date.now()}`,
           role: "assistant",
@@ -138,13 +127,12 @@ export function Chat() {
           created_at: new Date().toISOString(),
         };
         setMessages((prev) => [...prev, errorMessage]);
-      } finally {
         setIsLoading(false);
-        setStreamingContent("");
+      } finally {
         inputRef.current?.focus();
       }
     },
-    [input, isLoading]
+    [input, isLoading],
   );
 
   const handleClear = async () => {
@@ -156,6 +144,8 @@ export function Chat() {
       });
       setMessages([]);
       setHasActiveContainer(false);
+      setHasPendingTask(false);
+      setIsLoading(false);
     } catch (error) {
       console.error("Failed to clear chat:", error);
     }
@@ -173,7 +163,11 @@ export function Chat() {
               className={`h-2 w-2 ${hasActiveContainer ? "fill-green-500 text-green-500" : "fill-gray-300 text-gray-300"}`}
             />
             <span className="text-gray-500">
-              {hasActiveContainer ? "Connected" : "Idle"}
+              {hasPendingTask
+                ? "Working..."
+                : hasActiveContainer
+                  ? "Connected"
+                  : "Idle"}
             </span>
           </div>
         </div>
@@ -191,7 +185,7 @@ export function Chat() {
       {/* Messages */}
       <ScrollArea className="flex-1 p-4">
         <div ref={scrollRef} className="space-y-4">
-          {messages.length === 0 && !streamingContent ? (
+          {messages.length === 0 && !isLoading ? (
             <div className="flex flex-col items-center justify-center h-[400px] text-gray-500">
               <Bot className="h-12 w-12 mb-4 text-gray-300" />
               <p className="text-lg font-medium">Welcome to NanoClaw</p>
@@ -203,16 +197,16 @@ export function Chat() {
               {messages.map((message) => (
                 <MessageBubble key={message.id} message={message} />
               ))}
-              {streamingContent && (
-                <MessageBubble
-                  message={{
-                    id: "streaming",
-                    role: "assistant",
-                    content: streamingContent,
-                    created_at: new Date().toISOString(),
-                  }}
-                  isStreaming
-                />
+              {isLoading && (
+                <div className="flex gap-3">
+                  <div className="flex-shrink-0 h-8 w-8 rounded-full flex items-center justify-center bg-gray-100">
+                    <Bot className="h-4 w-4 text-gray-600" />
+                  </div>
+                  <div className="rounded-lg px-4 py-2 bg-gray-100 text-gray-500 text-sm flex items-center gap-2">
+                    <Loader2 className="h-3 w-3 animate-spin" />
+                    Thinking...
+                  </div>
+                </div>
               )}
             </>
           )}
@@ -243,13 +237,7 @@ export function Chat() {
   );
 }
 
-function MessageBubble({
-  message,
-  isStreaming = false,
-}: {
-  message: Message;
-  isStreaming?: boolean;
-}) {
+function MessageBubble({ message }: { message: Message }) {
   const isUser = message.role === "user";
 
   return (
@@ -279,9 +267,6 @@ function MessageBubble({
             </ReactMarkdown>
           </div>
         )}
-        {isStreaming && (
-          <span className="inline-block w-2 h-4 ml-1 bg-gray-400 animate-pulse" />
-        )}
       </div>
     </div>
   );
@@ -292,14 +277,12 @@ export function FloatingChat() {
 
   return (
     <>
-      {/* Chat Panel */}
       {isOpen && (
         <div className="fixed bottom-20 right-6 w-[420px] h-[600px] z-50 shadow-2xl rounded-xl overflow-hidden border border-gray-200">
           <Chat />
         </div>
       )}
 
-      {/* FAB */}
       <button
         onClick={() => setIsOpen(!isOpen)}
         className="fixed bottom-6 right-6 z-50 h-14 w-14 rounded-full bg-gray-900 text-white flex items-center justify-center shadow-lg hover:bg-gray-800 transition-colors"

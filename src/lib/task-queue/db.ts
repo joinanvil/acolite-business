@@ -15,6 +15,14 @@ import type {
 
 let initialized = false;
 
+export async function _resetForTests(): Promise<void> {
+  initialized = false;
+  await client.execute(`DELETE FROM nanoclaw_task_logs`);
+  await client.execute(`DELETE FROM nanoclaw_tasks`);
+  await client.execute(`DELETE FROM nanoclaw_task_policies`);
+  await client.execute(`DELETE FROM nanoclaw_task_triggers`);
+}
+
 export async function initTaskQueue(): Promise<void> {
   if (initialized) return;
   await initDb();
@@ -35,6 +43,7 @@ export async function initTaskQueue(): Promise<void> {
                       CHECK(priority IN ('urgent','high','normal','low')),
       created_by      TEXT NOT NULL DEFAULT 'human'
                       CHECK(created_by IN ('human','agent','trigger')),
+      assigned_to     TEXT CHECK(assigned_to IN ('general-manager','engineering','product','marketing')),
       parent_task_id  TEXT,
       depth           INTEGER NOT NULL DEFAULT 0,
       trigger_id      TEXT,
@@ -53,10 +62,18 @@ export async function initTaskQueue(): Promise<void> {
     )
   `);
 
+  // Add assigned_to column if missing (migration for existing databases)
+  try {
+    await client.execute(`ALTER TABLE nanoclaw_tasks ADD COLUMN assigned_to TEXT CHECK(assigned_to IN ('general-manager','engineering','product','marketing'))`);
+  } catch {
+    // Column already exists
+  }
+
   await client.execute(`CREATE INDEX IF NOT EXISTS idx_tasks_user_status ON nanoclaw_tasks(user_id, status)`);
   await client.execute(`CREATE INDEX IF NOT EXISTS idx_tasks_due ON nanoclaw_tasks(status, next_run)`);
   await client.execute(`CREATE INDEX IF NOT EXISTS idx_tasks_parent ON nanoclaw_tasks(parent_task_id)`);
   await client.execute(`CREATE INDEX IF NOT EXISTS idx_tasks_updated ON nanoclaw_tasks(user_id, updated_at)`);
+  await client.execute(`CREATE INDEX IF NOT EXISTS idx_tasks_assigned ON nanoclaw_tasks(assigned_to, status)`);
 
   // Policies
   await client.execute(`
@@ -131,6 +148,7 @@ function rowToTask(row: Record<string, unknown>): Task {
     status: row.status as TaskStatus,
     priority: row.priority as Task["priority"],
     created_by: row.created_by as Task["created_by"],
+    assigned_to: (row.assigned_to as Task["assigned_to"]) ?? null,
     parent_task_id: row.parent_task_id as string | null,
     depth: row.depth as number,
     trigger_id: row.trigger_id as string | null,
@@ -172,6 +190,7 @@ export async function createTask(input: CreateTaskInput): Promise<Task> {
     status: input.status ?? "todo",
     priority: input.priority ?? "normal",
     created_by: input.created_by ?? "human",
+    assigned_to: input.assigned_to ?? null,
     parent_task_id: input.parent_task_id ?? null,
     depth,
     trigger_id: input.trigger_id ?? null,
@@ -191,14 +210,14 @@ export async function createTask(input: CreateTaskInput): Promise<Task> {
   await client.execute({
     sql: `INSERT INTO nanoclaw_tasks
           (id, user_id, title, description, prompt, status, priority,
-           created_by, parent_task_id, depth, trigger_id,
+           created_by, assigned_to, parent_task_id, depth, trigger_id,
            schedule_type, schedule_value, next_run,
            metadata, created_at, updated_at)
-          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     args: [
       task.id, task.user_id, task.title, task.description, task.prompt,
-      task.status, task.priority, task.created_by, task.parent_task_id,
-      task.depth, task.trigger_id,
+      task.status, task.priority, task.created_by, task.assigned_to,
+      task.parent_task_id, task.depth, task.trigger_id,
       task.schedule_type, task.schedule_value, task.next_run,
       task.metadata, task.created_at, task.updated_at,
     ],
@@ -222,6 +241,7 @@ export async function listTasks(
   opts?: {
     status?: TaskStatus | TaskStatus[];
     priority?: Task["priority"];
+    assigned_to?: Task["assigned_to"];
     parentTaskId?: string | null; // null = root only, undefined = all
     includeCompleted?: boolean;
     limit?: number;
@@ -248,6 +268,15 @@ export async function listTasks(
   if (opts?.priority) {
     conditions.push("priority = ?");
     args.push(opts.priority);
+  }
+
+  if (opts?.assigned_to !== undefined) {
+    if (opts.assigned_to === null) {
+      conditions.push("assigned_to IS NULL");
+    } else {
+      conditions.push("assigned_to = ?");
+      args.push(opts.assigned_to);
+    }
   }
 
   if (opts?.parentTaskId === null) {
@@ -292,6 +321,7 @@ export async function updateTask(taskId: string, updates: UpdateTaskInput): Prom
   if (updates.description !== undefined) { sets.push("description = ?"); args.push(updates.description); }
   if (updates.prompt !== undefined) { sets.push("prompt = ?"); args.push(updates.prompt); }
   if (updates.priority !== undefined) { sets.push("priority = ?"); args.push(updates.priority); }
+  if (updates.assigned_to !== undefined) { sets.push("assigned_to = ?"); args.push(updates.assigned_to); }
   if (updates.schedule_type !== undefined) { sets.push("schedule_type = ?"); args.push(updates.schedule_type); }
   if (updates.schedule_value !== undefined) { sets.push("schedule_value = ?"); args.push(updates.schedule_value); }
   if (updates.last_result !== undefined) { sets.push("last_result = ?"); args.push(updates.last_result); }
@@ -420,6 +450,32 @@ export async function getQueuedImmediateTasks(): Promise<Task[]> {
             created_at ASC
           LIMIT 10`,
     args: [],
+  });
+  return result.rows.map((row) => rowToTask(row as unknown as Record<string, unknown>));
+}
+
+export async function getQueuedTasksForTeam(team: Task["assigned_to"]): Promise<Task[]> {
+  await initTaskQueue();
+  if (team === null) {
+    const result = await client.execute({
+      sql: `SELECT * FROM nanoclaw_tasks
+            WHERE status = 'queued' AND assigned_to IS NULL AND prompt IS NOT NULL AND next_run IS NULL
+            ORDER BY
+              CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,
+              created_at ASC
+            LIMIT 10`,
+      args: [],
+    });
+    return result.rows.map((row) => rowToTask(row as unknown as Record<string, unknown>));
+  }
+  const result = await client.execute({
+    sql: `SELECT * FROM nanoclaw_tasks
+          WHERE status = 'queued' AND assigned_to = ? AND prompt IS NOT NULL AND next_run IS NULL
+          ORDER BY
+            CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1 WHEN 'normal' THEN 2 ELSE 3 END,
+            created_at ASC
+          LIMIT 10`,
+    args: [team],
   });
   return result.rows.map((row) => rowToTask(row as unknown as Record<string, unknown>));
 }
